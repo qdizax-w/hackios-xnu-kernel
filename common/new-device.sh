@@ -35,7 +35,7 @@ if m:
     if len(cells) == 4: gic = [hex(cells[0]), hex(cells[2])]
     elif len(cells) >= 8: gic = [hex((cells[0] << 32) | cells[1]), hex((cells[4] << 32) | cells[5])]
 cpus = []
-for m in re.finditer(r'\n\t*cpu@([0-9a-f]+) \{(.*?)\n\t*\};', dts, re.S):
+for m in re.finditer(r'\n\t*(?:[\w-]+: )?cpu@([0-9a-f]+) \{(.*?)\n\t*\};', dts, re.S):
     cap = re.search(r'capacity-dmips-mhz = <(0x[0-9a-f]+)>', m.group(2))
     cpus.append((int(m.group(1), 16), int(cap.group(1), 16) if cap else 0))
 shift = 8 if any(r >= 0x100 for r, _ in cpus) else 0
