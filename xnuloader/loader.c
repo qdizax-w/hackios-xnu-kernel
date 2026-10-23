@@ -537,13 +537,14 @@ struct platform {
 /*
  * The boot-args that start one of the kernel's phone drivers (bsd/dev/redwood_*.c) which writes to
  * the POCO X5 Pro's own addresses -- its pins, PMICs, clocks, serial engines, UFS host -- with no
- * other check. Wi-Fi (wifi=), the audio DSP (adsp=) and gpu= are not here: those drivers check the
- * SoC base themselves, and another phone's description has a different io_base. adreno= and
- * display_probe= are, because they go past that check.
+ * other check. Wi-Fi (wifi=), the audio DSP (adsp=), gpu= and adreno= are not here: those drivers
+ * check the SoC base themselves (adreno= runs on miatoll as far as its steps have been ported to it),
+ * and another phone's description has a different io_base. display_probe= is, because it goes past
+ * that check.
  */
 static const char *const redwood_driver_args[] = {
 	"touchscreen", "buttons", "cpufreq", "ddr", "battery", "haptic", "torch", "cam", "speaker_probe",
-	"adreno", "display_probe", "ufs_native", NULL
+	"display_probe", "ufs_native", NULL
 };
 
 static const struct platform platform_qemu_virt = {
