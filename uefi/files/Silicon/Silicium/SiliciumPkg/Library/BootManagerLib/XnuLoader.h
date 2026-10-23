@@ -2,10 +2,11 @@
 #define _XNU_LOADER_H_
 
 //
-// The boot shim copies everything appended after the UEFI FD to this address.
-// The region is marked reserved in the device memory map.
+// The boot shim copies everything appended after the UEFI FD to the "XNU Payload"
+// region of the device memory map (reserved there); this is its address where the
+// map has no such region (redwood's).
 //
-#define XNU_PAYLOAD_BASE      0xF0000000ULL
+#define XNU_PAYLOAD_DEFAULT_BASE  0xF0000000ULL
 #define XNU_PAYLOAD_MAX_SIZE  0x04000000ULL
 #define XNU_PAYLOAD_MAGIC     0x50554E58 // "XNUP"
 

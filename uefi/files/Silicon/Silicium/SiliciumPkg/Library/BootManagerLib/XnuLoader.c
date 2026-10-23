@@ -14,6 +14,7 @@
 
 #include <Library/BaseLib.h>
 #include <Library/BaseMemoryLib.h>
+#include <Library/MemoryMapHelperLib.h>
 #include <Library/MemoryAllocationLib.h>
 #include <Library/PrintLib.h>
 #include <Library/UefiBootServicesTableLib.h>
@@ -174,13 +175,26 @@ LogMemoryMap ()
 }
 
 STATIC
+UINT64
+PayloadBase ()
+{
+  EFI_MEMORY_REGION_DESCRIPTOR Region;
+
+  if (!EFI_ERROR (LocateMemoryRegionByName ("XNU Payload", &Region))) {
+    return Region.Address;
+  }
+
+  return XNU_PAYLOAD_DEFAULT_BASE;
+}
+
+STATIC
 VOID
 LogPayload ()
 {
-  XNU_PAYLOAD_HEADER *Header = (XNU_PAYLOAD_HEADER *)XNU_PAYLOAD_BASE;
+  XNU_PAYLOAD_HEADER *Header = (XNU_PAYLOAD_HEADER *)(UINTN)PayloadBase ();
 
   Log ("[payload]\n");
-  Log ("base=%lx magic=%08x size=%x\n", (UINT64)XNU_PAYLOAD_BASE, Header->Magic, Header->Size);
+  Log ("base=%lx magic=%08x size=%x\n", PayloadBase (), Header->Magic, Header->Size);
 
 }
 
@@ -194,7 +208,7 @@ LogPersistence ()
   // (Device registers are deliberately not probed here: an MMIO read of the
   // IMEM / watchdog blocks took a synchronous exception on this platform.)
   //
-  UINT32 *Ram = (UINT32 *)(UINTN)(XNU_PAYLOAD_BASE + XNU_PAYLOAD_MAX_SIZE - SIZE_4KB);
+  UINT32 *Ram = (UINT32 *)(UINTN)(PayloadBase () + XNU_PAYLOAD_MAX_SIZE - SIZE_4KB);
 
   Log ("[persistence]\n");
   Log ("ram_before=%08x %08x\n", Ram[0], Ram[1]);
@@ -237,7 +251,7 @@ STATIC
 VOID
 StartPayloadLoader ()
 {
-  XNU_PAYLOAD_HEADER *Header = (XNU_PAYLOAD_HEADER *)XNU_PAYLOAD_BASE;
+  XNU_PAYLOAD_HEADER *Header = (XNU_PAYLOAD_HEADER *)(UINTN)PayloadBase ();
   UINT8              *Cursor;
   UINT8              *End;
 

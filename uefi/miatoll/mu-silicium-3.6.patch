@@ -1,0 +1,95 @@
+diff --git a/BootShim/BootShim.S b/BootShim/BootShim.S
+index 4d20855..3c3b17b 100644
+--- a/BootShim/BootShim.S
++++ b/BootShim/BootShim.S
+@@ -28,6 +28,27 @@ _CopyLoop:
+   stp   x2, x3, [x5], #16
+   subs  x6, x6, #16
+   b.ne  _CopyLoop
++
++#ifdef PAYLOAD_BASE
++  /* x4 now points just past the FD: an optional "XNUP" payload may follow */
++  ldr   w2, [x4]
++  movz  w3, #0x4E58
++  movk  w3, #0x5055, lsl #16
++  cmp   w2, w3
++  b.ne  _NoPayload
++  ldr   w6, [x4, #4]    /* Payload Size */
++  add   x6, x6, #23     /* Header + Round Up to 16 */
++  and   x6, x6, #~15
++  movz  x5, #(PAYLOAD_BASE >> 16), lsl #16
++
++_PayloadLoop:
++  ldp   x2, x3, [x4], #16
++  stp   x2, x3, [x5], #16
++  subs  x6, x6, #16
++  b.ne  _PayloadLoop
++
++_NoPayload:
++#endif
+   ldr   x5, =FD_BASE
+ 
+ _Entry:
+diff --git a/Platforms/Xiaomi/miatollPkg/Library/MemoryMapLib/MemoryMapLib.c b/Platforms/Xiaomi/miatollPkg/Library/MemoryMapLib/MemoryMapLib.c
+index a3dc84d..9f4ae8a 100644
+--- a/Platforms/Xiaomi/miatollPkg/Library/MemoryMapLib/MemoryMapLib.c
++++ b/Platforms/Xiaomi/miatollPkg/Library/MemoryMapLib/MemoryMapLib.c
+@@ -26,6 +26,7 @@ gMemoryDescriptor[] = {
+   {"UEFI Stack",        0x9FF90000, 0x00040000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK_XN},
+   {"Log Buffer",        0x9FFF7000, 0x00008000, AddMem, SYS_MEM, SYS_MEM_CAP, RtData, WRITE_BACK_XN},
+   {"Info Blk",          0x9FFFF000, 0x00001000, AddMem, SYS_MEM, SYS_MEM_CAP, RtData, WRITE_BACK_XN},
++  {"XNU Payload",       0xB0000000, 0x04000000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
+ 
+   // Other Memory Regions
+   {"AOP_SS_MSG_RAM",    0x0C300000, 0x00100000, NoHob,  MMAP_IO, INITIALIZED, Conv,  NS_DEVICE},
+diff --git a/Silicon/Silicium/SiliciumPkg/Library/PlatformBootManagerLib/PlatformBootManager.c b/Silicon/Silicium/SiliciumPkg/Library/PlatformBootManagerLib/PlatformBootManager.c
+index 5a7f12d..ebf5cef 100644
+--- a/Silicon/Silicium/SiliciumPkg/Library/PlatformBootManagerLib/PlatformBootManager.c
++++ b/Silicon/Silicium/SiliciumPkg/Library/PlatformBootManagerLib/PlatformBootManager.c
+@@ -21,6 +21,7 @@
+ #include <Configuration/BootDevices.h>
+ 
+ #include "PlatformBootManager.h"
++#include "XnuLoader.h"
+ 
+ //
+ // Global Variables
+@@ -274,6 +275,9 @@ PlatformBootManagerUnableToBoot ()
+ {
+   EFI_STATUS Status;
+ 
++  // Nothing else to boot: hand over to the XNU loader (does not return)
++  XnuLoaderMain ();
++
+   // Display No Boot OS Logo
+   Status = DisplayBootGraphic (BG_NO_BOOT_OS);
+   if (EFI_ERROR (Status)) {
+diff --git a/Silicon/Silicium/SiliciumPkg/Library/PlatformBootManagerLib/PlatformBootManagerLib.inf b/Silicon/Silicium/SiliciumPkg/Library/PlatformBootManagerLib/PlatformBootManagerLib.inf
+index 7fb495c..5bd57d2 100644
+--- a/Silicon/Silicium/SiliciumPkg/Library/PlatformBootManagerLib/PlatformBootManagerLib.inf
++++ b/Silicon/Silicium/SiliciumPkg/Library/PlatformBootManagerLib/PlatformBootManagerLib.inf
+@@ -14,6 +14,7 @@
+ 
+ [Sources]
+   PlatformBootManager.c
++  XnuLoader.c
+   KeyCallback.c
+ 
+ [Packages]
+@@ -37,6 +38,9 @@
+   BootGraphicsLib
+   DevicePathLib
+   PrintLib
++  BaseLib
++  BaseMemoryLib
++  MemoryMapHelperLib
+ 
+ [Pcd]
+   gEfiMdePkgTokenSpaceGuid.PcdPlatformBootTimeOut
+@@ -51,3 +55,6 @@
+ [Protocols]
+   gKeypadDeviceProtocolGuid
+   gEfiSimpleTextInputExProtocolGuid
++  gEfiGraphicsOutputProtocolGuid
++  gEfiBlockIoProtocolGuid
++  gEfiPartitionInfoProtocolGuid

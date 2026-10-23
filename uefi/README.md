@@ -31,6 +31,10 @@ source ../venv/bin/activate
 python3 build_uefi.py -d redwood -r RELEASE     # -> Build/redwoodPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd
 ```
 
+miatoll is built from Mu-Silicium 3.6 instead (later releases do not boot on it), with clang 18: `uefi/miatoll/apply.sh`,
+then `CLANG_BIN=<llvm-18>/bin/ python3 build_uefi.py -d miatoll -m 0 -r RELEASE` in `Mu-Silicium-3.6` (`-m`: the model,
+0-5, only the SMBIOS names differ). See `docs/PORTING.md`, "miatoll".
+
 A pitfall: the `mu_nasm` dependency is installed through NuGet and needs Mono. To do without Mono, put the
 system nasm in its place:
 
