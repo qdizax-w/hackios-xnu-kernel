@@ -76,7 +76,18 @@ verbose boot text (`-v`), then SpringBoard. Read [checks.md](checks.md) before t
 ## miatoll (Snapdragon 720G, SM7125)
 
 Redmi Note 9S / 9 Pro / 9 Pro Max, Redmi Note 10 Lite, POCO M2 Pro: `common/devices/miatoll.conf`. **Reaches the home
-screen** on a 4 GB curtana (Redmi Note 9S), all eight cores, **with touch** (the Huaxing panel's FT8756). What it took:
+screen** on a 4 GB curtana (Redmi Note 9S), all eight cores, **with touch** (the Huaxing panel's FT8756).
+
+The port is on the `miatoll` branches of github.com/qdizax-w/hackios-xnu-kernel and hackios-xnu-userland:
+
+```sh
+git clone -b miatoll https://github.com/qdizax-w/hackios-xnu-kernel.git hackios && cd hackios
+USERLAND_URL=https://github.com/qdizax-w/hackios-xnu-userland.git USERLAND_REF=miatoll common/setup.sh
+uefi/miatoll/apply.sh && tools/mk-fw-touch-miatoll.sh        # then the UEFI with clang 18, below
+common/build.sh miatoll && common/run.sh miatoll
+```
+
+What it took:
 
 - **UEFI: Mu-Silicium 3.6, built with clang 18.** Later Mu-Silicium releases do not boot on these phones (Mi logo, a
   reset after a second, again), and no release built with clang 23 does either -- the official 3.6 image boots, the same
