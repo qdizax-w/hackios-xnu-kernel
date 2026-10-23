@@ -169,6 +169,8 @@
 #include <sys/redwood_sta.h>
 #include <sys/stat.h>
 #include <sys/systm.h>
+#include <sys/vnode.h>
+#include <sys/vnode_internal.h>
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -441,6 +443,59 @@ put(struct block *b, const char *name, uint32_t offset, uint32_t value)
 	wr(b->base + offset, value);
 }
 
+/* ---- which phone: the DSP the radio's firmware runs on, and how to reach it ------------------------------ */
+
+/*
+ * redwood's numbers are the defaults, and the comments below are about them. miatoll (SM7125:
+ * Redmi Note 9S and its siblings) has a WCN3990, whose firmware runs on the modem's DSP ("MPSS"),
+ * started the same way through TrustZone (dt: qcom,mss@4080000, qcom,pil-tz-generic): image 4,
+ * its memory reserved-memory modem_region@86000000 (132 MB, every byte of which the image's
+ * segments cover), processor 1 in the shared memory (dt: qcom,smp2p-modem, qcom,glink modem), its
+ * SMP2P items 435 (its) and 428 (ours: entries "master-kernel" and "ipa"; qcom,smem lists the inbound
+ * item first, Linux's smp2p.c -- the first boot took 435 for ours and the modem wrote into it), its last words in item
+ * 421 (qcom,smem-id). The shared memory, its lock and the always-on processor's mailbox are where
+ * redwood has them; the doorbells are not IPCC but the application processors' IPC register of
+ * the APCS (dt: mailbox@17C00000, qcom,atoll-apcs-hmss-global; Linux 4.14's driver: the register
+ * at +12, one bit a doorbell): bit 0 the always-on processor, 12 the modem's GLINK, 14 its SMP2P.
+ * Nothing says who has rung us there -- that is an interrupt each, and none is taken here --, so
+ * on miatoll only the shared memory is watched.
+ */
+static struct {
+	const char *name;
+	uint16_t host;                          /* the DSP's number in the shared memory */
+	uint32_t item_ours, item_theirs, item_crash;
+	const char *second_entry;               /* our SMP2P entry besides "master-kernel" */
+	uint32_t pas, memory, memory_size;      /* TrustZone's image number; the reserved memory */
+	const char *fw;                         /* the image's files: fw/<fw>.mdt and fw/<fw>.bNN */
+	const char *aop;                        /* the always-on processor's name for the image */
+	bool apcs;                              /* doorbells: the APCS IPC register, not IPCC */
+	bool survey;                            /* steps 3 to 5 know this phone's supplies and pins */
+	uint32_t last;                          /* the last step there is for it so far */
+} dsp = {
+	.name = "redwood's Wi-Fi DSP (WPSS)", .host = 13, .item_ours = 616, .item_theirs = 617, .item_crash = 626,
+	.second_entry = "wlan", .pas = 6, .memory = 0x9ae00000u, .memory_size = 0x01900000u, .fw = "wpss", .aop = "wpss",
+	.survey = true, .last = 16,
+};
+
+static void
+dsp_profile_miatoll(void)
+{
+	dsp.name = "miatoll's modem (MPSS), which runs the WCN3990's firmware";
+	dsp.host = 1;
+	dsp.item_ours = 428;
+	dsp.item_theirs = 435;
+	dsp.item_crash = 421;
+	dsp.second_entry = "ipa";
+	dsp.pas = 4;
+	dsp.memory = 0x86000000u;
+	dsp.memory_size = 0x08400000u;
+	dsp.fw = "modem";
+	dsp.aop = "modem";
+	dsp.apcs = true;
+	dsp.survey = false;
+	dsp.last = 14;                          /* (QRTR: the radio's own driver for it is still to come) */
+}
+
 /* ---- step 1: the shared memory area ------------------------------------------------------------------- */
 
 /*
@@ -454,7 +509,7 @@ put(struct block *b, const char *name, uint32_t offset, uint32_t value)
 #define SMEM_PHYS               0x80900000UL
 #define SMEM_SIZE               0x00200000u
 #define SMEM_US                 0
-#define SMEM_WPSS               13
+#define SMEM_WPSS               dsp.host
 #define SMEM_GLOBAL             0xfffe          /* both "hosts" of the global partition */
 #define SMEM_VERSION            (0x40 + 4 * 7)  /* of the old header at the start: the boot loader's word, [31:16] */
 #define SMEM_VERSION_PARTITIONS 12              /* ... which is this where everything is in partitions */
@@ -486,9 +541,9 @@ struct smem_item {
 };
 
 /* The DSP's items (dt: qcom,smem of qcom,smp2p-wpss, qcom,smem-id of qcom,wpss@8a00000). */
-#define ITEM_SMP2P_OURS         616             /* SMP2P from us to the DSP: ours to allocate, when there is something to say */
-#define ITEM_SMP2P_THEIRS       617             /* ... and from the DSP to us */
-#define ITEM_CRASH_REASON       626             /* a line of text the DSP leaves when it gives up */
+#define ITEM_SMP2P_OURS         dsp.item_ours   /* SMP2P from us to the DSP: ours to allocate, when there is something to say */
+#define ITEM_SMP2P_THEIRS       dsp.item_theirs /* ... and from the DSP to us */
+#define ITEM_CRASH_REASON       dsp.item_crash  /* a line of text the DSP leaves when it gives up */
 
 static const volatile uint8_t *smem;
 
@@ -601,7 +656,7 @@ static uint32_t
 smem_item(uint32_t item, uint32_t *size)
 {
 	static struct smem_item found[256];
-	static const uint16_t hosts[2][2] = { { SMEM_US, SMEM_WPSS }, { SMEM_GLOBAL, SMEM_GLOBAL } };
+	const uint16_t hosts[2][2] = { { SMEM_US, SMEM_WPSS }, { SMEM_GLOBAL, SMEM_GLOBAL } };
 
 	for (unsigned h = 0; h < 2; h++) {
 		uint32_t cacheline = 0, partition_size = 0;
@@ -836,6 +891,27 @@ static struct block ipcc = { "ipcc", 0x00408000, 0x1000 };
 #define IPCC_AOP                0u
 #define IPCC_WPSS               24u
 #define IPCC_SMP2P              2u              /* the signal */
+#define IPCC_GLINK              0u              /* the signal */
+
+/* miatoll's doorbells (see the top of this file): one register, one bit each */
+static struct block apcs = { "apcs ipc", 0x17c00000, 0x1000 };
+#define APCS_IPC                0x00c
+#define APCS_AOP                (1u << 0)
+#define APCS_GLINK              (1u << 12)
+#define APCS_SMP2P              (1u << 14)
+
+/* A doorbell, named as IPCC names it (client << 16 | signal); on miatoll the APCS bit that is that one. */
+static void
+doorbell_ring(uint32_t which)
+{
+	if (!dsp.apcs) {
+		wr(ipcc.base + IPCC_SEND, which);
+		return;
+	}
+	need(&apcs);
+	wr(apcs.base + APCS_IPC, which == (IPCC_AOP << 16) ? APCS_AOP : which == (IPCC_WPSS << 16 | IPCC_SMP2P) ? APCS_SMP2P :
+	    APCS_GLINK);
+}
 
 static bool
 step_mailbox(void)
@@ -866,8 +942,10 @@ step_mailbox(void)
 		get(&aoss, "the length of the message in our mailbox", box);
 	}
 
-	announce("read who has rung our doorbell (IPCC, 0x408000: the first access to that block)");
-	get(&ipcc, "received", IPCC_RECEIVED);
+	if (!dsp.apcs) {
+		announce("read who has rung our doorbell (IPCC, 0x408000: the first access to that block)");
+		get(&ipcc, "received", IPCC_RECEIVED);
+	}
 	return true;
 }
 
@@ -999,6 +1077,11 @@ step_rpmh(void)
 {
 	static const char *const kinds[] = { "at once", "at once", "asleep", "asleep", "asleep", "awake", "awake", "awake" };
 	uint32_t id, config, count, commands;
+
+	if (!dsp.survey) {
+		printf("wifi: %u: this step looks at redwood's supplies and pins: not this phone's, left out\n", step);
+		return true;
+	}
 
 	announce("look up the supplies involved in the boot loader's list of RPMh resources (memory at 0x80860000)");
 	if (!cmd_db_there()) {
@@ -1144,6 +1227,11 @@ step_rails(void)
 {
 	uint32_t version;
 
+	if (!dsp.survey) {
+		printf("wifi: %u: this step looks at redwood's supplies and pins: not this phone's, left out\n", step);
+		return true;
+	}
+
 	announce("map the PMIC arbiter (0xc440000, 0xc40a000, 0xe600000; the buttons' driver reads through it too) and read "
 	    "its version");
 	version = get(&arb_core, "version", ARB_VERSION);
@@ -1243,6 +1331,11 @@ step_pins(void)
 		const char *what;
 	} pins[] = { { 84, "the radio's enable or reset" }, { 85, "Bluetooth's reset" }, { 86, "Bluetooth's sw-ctrl" } };
 
+	if (!dsp.survey) {
+		printf("wifi: %u: this step looks at redwood's supplies and pins: not this phone's, left out\n", step);
+		return true;
+	}
+
 	announce("read how the firmware left the radio's pins (registers the touch screen's driver uses too)");
 	need(&tlmm);
 	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
@@ -1257,9 +1350,9 @@ step_pins(void)
 
 /* ---- step 6: the firmware ------------------------------------------------------------------------------ */
 
-#define PAS_WPSS                6               /* dt: qcom,pas-id of qcom,wpss@8a00000 */
-#define WPSS_MEMORY             0x9ae00000u     /* dt: reserved-memory wlan@9ae00000, that node's memory-region */
-#define WPSS_MEMORY_SIZE        0x01900000u
+#define PAS_WPSS                dsp.pas         /* dt: qcom,pas-id of qcom,wpss@8a00000 */
+#define WPSS_MEMORY             dsp.memory      /* dt: reserved-memory wlan@9ae00000, that node's memory-region */
+#define WPSS_MEMORY_SIZE        dsp.memory_size
 
 extern dev_t mdevlookup(int devid);
 extern int mdevgetkernelrange(dev_t dev, vm_offset_t *base, uint64_t *size);
@@ -1270,12 +1363,17 @@ extern int mdevgetkernelrange(dev_t dev, vm_offset_t *base, uint64_t *size);
  * is in fw-wifi/ there --, found in the memory of the RAM disk itself (see redwood_adreno.c).
  */
 extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern const uint8_t *redwood_adsp_fw_file(const char *name, uint64_t *size);  /* (a file of /fw on the root) */
 static const uint8_t *
 image_file(const char *name, uint64_t *size)
 {
 	const uint8_t *data = redwood_image_file("fw", name, size, NULL);  /* (redwood_image.c) */
 
 	if (data != NULL) {
+		return data;
+	}
+	/* (or /fw on the root, readable once it is mounted -- see redwood_adsp.c) */
+	if ((data = redwood_adsp_fw_file(name, size)) != NULL) {
 		return data;
 	}
 	printf("wifi: %u: no fw/%s in the small image: put the phone's /vendor/firmware_mnt/image/%s into fw-wifi/ and run "
@@ -1290,7 +1388,7 @@ image_file(const char *name, uint64_t *size)
  * where the memory reserved for the DSP is, which on this phone is where they say they are.
  */
 #define MDT_HASH(flags)         (((flags) >> 24 & 7) == 2)      /* the segment that is the block of hashes */
-#define MAX_SEGMENTS            16
+#define MAX_SEGMENTS            32
 
 struct elf_segment {
 	uint32_t type, offset, vaddr, paddr, file_size, memory_size, flags, align;
@@ -1315,17 +1413,19 @@ step_firmware(void)
 	const uint8_t *header;
 	uint64_t size = 0, files = 0;
 	uint32_t count, hashes = 0, lowest = ~0u, highest = 0;
+	char name_mdt[24];
 
 	announce("find the DSP's image in the small image that came with the kernel, and check it against its own header");
 	image.segments = 0;
-	header = image_file("wpss.mdt", &size);
+	snprintf(name_mdt, sizeof(name_mdt), "%s.mdt", dsp.fw);
+	header = image_file(name_mdt, &size);
 	if (header == NULL) {
 		return false;
 	}
 	/* a 32-bit ELF: the count of segments at 44, the table of them at 52, 32 bytes each */
 	count = size >= 52 + 2 * 32 ? header[44] | header[45] << 8 : 0;
-	if (memcmp(header, "\177ELF\1", 5) != 0 || count < 3 || count > MAX_SEGMENTS || 52 + 32 * count > size || size > PAGE_SIZE) {
-		printf("wifi: %u: fw/wpss.mdt is not such a header (%02x %02x %02x %02x, %u segments, %llu bytes)\n", step, header[0],
+	if (memcmp(header, "\177ELF\1", 5) != 0 || count < 3 || count > MAX_SEGMENTS || 52 + 32 * count > size || size > 4 * PAGE_SIZE) {
+		printf("wifi: %u: fw/%s is not such a header (%02x %02x %02x %02x, %u segments, %llu bytes)\n", step, name_mdt, header[0],
 		    header[1], header[2], header[3], count, size);
 		return false;
 	}
@@ -1352,7 +1452,7 @@ step_firmware(void)
 		if (segment.file_size != 0) {
 			uint64_t file_size = 0;
 
-			snprintf(name, sizeof(name), "wpss.b%02u", i);
+			snprintf(name, sizeof(name), "%s.b%02u", dsp.fw, i);
 			image.segment[image.segments].file = image_file(name, &file_size);
 			if (image.segment[image.segments].file == NULL) {
 				return false;
@@ -1402,6 +1502,11 @@ mailbox_wait(uint32_t offset, uint32_t value, uint32_t ms)
 static void
 ring(uint32_t client, uint32_t signal, const char *whose)
 {
+	if (dsp.apcs) {
+		need(&apcs);
+		put(&apcs, whose, APCS_IPC, client == IPCC_AOP ? APCS_AOP : signal == IPCC_SMP2P ? APCS_SMP2P : APCS_GLINK);
+		return;
+	}
 	put(&ipcc, whose, IPCC_SEND, client << 16 | signal);
 }
 
@@ -1419,7 +1524,7 @@ static struct {
 static void
 doorbells(void)
 {
-	for (unsigned i = 0; i < 8; i++) {
+	for (unsigned i = 0; i < 8 && !dsp.apcs; i++) {
 		uint32_t who = rd(ipcc.base + IPCC_RECEIVED);
 
 		if (who == IPCC_NOBODY) {
@@ -1518,7 +1623,8 @@ step_mailbox_open_locked(void)
 		ring(IPCC_AOP, 0, "the always-on processor's doorbell");
 		return false;
 	}
-	printf("wifi: %u: THE MAILBOX TO THE ALWAYS-ON PROCESSOR IS OPEN; the doorbells say %#x\n", step, rd(ipcc.base + IPCC_RECEIVED));
+	printf("wifi: %u: THE MAILBOX TO THE ALWAYS-ON PROCESSOR IS OPEN; the doorbells say %#x\n", step, dsp.apcs ? 0 :
+	    rd(ipcc.base + IPCC_RECEIVED));
 	our_box = box;
 	return true;
 }
@@ -1562,7 +1668,7 @@ mailbox_send_locked(const char *text)
 	}
 	wr(aoss.base + our_box, QMP_MESSAGE);
 	(void)rd(aoss.base + our_box);
-	wr(ipcc.base + IPCC_SEND, IPCC_AOP << 16 | 0);
+	doorbell_ring(IPCC_AOP << 16 | 0);
 	if (!mailbox_wait(our_box, 0, 1000)) {
 		printf("wifi: %u: THE ALWAYS-ON PROCESSOR DOES NOT TAKE THE MESSAGE within a second; it is taken back\n", step);
 		wr(aoss.base + our_box, 0);
@@ -1570,6 +1676,16 @@ mailbox_send_locked(const char *text)
 	}
 	printf("wifi: %u: the always-on processor has taken it\n", step);
 	return true;
+}
+
+/* "The image is loaded" / "is gone", to the always-on processor, by its name for the image. */
+static bool
+mailbox_send_image(const char *state)
+{
+	char text[QMP_MESSAGE];
+
+	snprintf(text, sizeof(text), "{class: image, res: load_state, name: %s, val: %s}", dsp.aop, state);
+	return mailbox_send(text);
 }
 
 /* ---- SMP2P, our half ----------------------------------------------------------------------------------- */
@@ -1583,7 +1699,7 @@ mailbox_send_locked(const char *text)
  * followed by a ring of the DSP's SMP2P doorbell.
  */
 #define OUR_ENTRY_STOP          "master-kernel"
-#define OUR_ENTRY_RADIO         "wlan"
+#define OUR_ENTRY_RADIO         dsp.second_entry
 #define DSP_STOP                (1u << 0)       /* of "master-kernel" */
 
 static void glink_reset(void);
@@ -1635,7 +1751,7 @@ dsp_listen(const struct smp2p *theirs)
 		    "its SMP2P doorbell\n", step, theirs->flags, SMEM_PHYS + our_item + SMP2P_AT_FLAGS, smp2p_restart_acked);
 		smem_poke(our_item + SMP2P_AT_FLAGS, (ours.flags & ~SMP2P_RESTART_ACK) | (smp2p_restart_acked ? SMP2P_RESTART_ACK : 0));
 		settle();
-		wr(ipcc.base + IPCC_SEND, IPCC_WPSS << 16 | IPCC_SMP2P);
+		doorbell_ring(IPCC_WPSS << 16 | IPCC_SMP2P);
 	}
 }
 
@@ -1679,7 +1795,7 @@ dsp_ask_to_stop(uint32_t bound_ms)
 	hold(true);
 	smem_poke(value_at, ours.entry[entry].value | DSP_STOP);
 	settle();
-	wr(ipcc.base + IPCC_SEND, IPCC_WPSS << 16 | IPCC_SMP2P);
+	doorbell_ring(IPCC_WPSS << 16 | IPCC_SMP2P);
 	asked = now = now_us();
 	while (now - asked < bound_ms * 1000ull) {
 		if (dsp_words(&theirs) && (dsp_state(&theirs) & (DSP_STOP_ACK | DSP_FATAL))) {
@@ -1695,7 +1811,7 @@ dsp_ask_to_stop(uint32_t bound_ms)
 	/* (taken back, as Linux does, before TrustZone is asked) */
 	smem_poke(value_at, ours.entry[entry].value & ~DSP_STOP);
 	settle();
-	wr(ipcc.base + IPCC_SEND, IPCC_WPSS << 16 | IPCC_SMP2P);
+	doorbell_ring(IPCC_WPSS << 16 | IPCC_SMP2P);
 	return (state & DSP_STOP_ACK) != 0;
 }
 
@@ -1780,10 +1896,12 @@ dsp_shutdown(const char *why)
 		return false;
 	}
 	printf("wifi: %u: THE WI-FI DSP IS SHUT DOWN\n", step);
-	wr(ipcc.base + IPCC_DISABLE, IPCC_WPSS << 16 | IPCC_SMP2P);     /* (as the boot chain left it) */
+	if (!dsp.apcs) {
+		wr(ipcc.base + IPCC_DISABLE, IPCC_WPSS << 16 | IPCC_SMP2P);     /* (as the boot chain left it) */
+	}
 	doorbells();
 	dsp_started = false;
-	mailbox_send("{class: image, res: load_state, name: wpss, val: off}");
+	mailbox_send_image("off");
 	/*
 	 * Nobody is left to use the radio's stream. Only after a DSP of ours: with wifi=1 the radio
 	 * is shown its memory before the DSP is started, and the shutdown of an earlier kernel's
@@ -1828,12 +1946,14 @@ step_header(void)
 
 	announce("hand the image's header to TrustZone to check its signature (image 6), in a page of ours");
 	/* in memory of ours, page-aligned and in one piece, not touched again and never freed (see redwood_adreno.c) */
-	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+	/* (in one physical piece: TrustZone is given one address; the modem's header is 9 KB) */
+	if (kmem_alloc_contig(kernel_map, &page, round_page(image.header_size), PAGE_MASK, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 		printf("wifi: %u: no memory\n", step);
 		return false;
 	}
 	memcpy((void *)page, image.header, image.header_size);
-	for (vm_offset_t line = page; line < page + PAGE_SIZE; line += 64) {
+	for (vm_offset_t line = page; line < page + round_page(image.header_size); line += 64) {
 		__asm__ volatile ("dc civac, %0" : : "r" (line));       /* TrustZone reads memory, not this processor's cache */
 	}
 	settle();
@@ -1873,25 +1993,25 @@ segment_word(unsigned s, uint32_t at)
 static bool
 step_image(void)
 {
-	volatile uint64_t *dsp_memory;
 	uint64_t written = 0, cleared = 0, wrong = 0;
+	const uint32_t window = 4u << 20;
 
 	if (image.segments == 0) {
 		return false;
 	}
-	announce("put the image's segments into the DSP's memory (0x9ae00000, 25 MB: memory of nobody's until TrustZone "
-	    "starts the DSP), with zeroes where a segment is longer than its file, and read them back");
+	announce("put the image's segments into the DSP's memory (memory of nobody's until TrustZone starts the DSP), with "
+	    "zeroes where a segment is longer than its file, and read them back");
 	/*
 	 * (The memory is looked at only now: TrustZone has just said that it is not its own. And it
-	 * is mapped for as long as this takes: 25 MB do not fit where ml_io_map() puts what stays.)
+	 * is mapped a window of 4 MB at a time: the modem's 132 MB do not fit in one, nor redwood's
+	 * 25 MB where ml_io_map() puts what stays. A segment of a length that is not a multiple of
+	 * eight -- the modem has two -- is written to the next multiple, zeroes; its own page.)
 	 */
-	dsp_memory = (volatile uint64_t *)ml_io_map_unmappable(WPSS_MEMORY, WPSS_MEMORY_SIZE, VM_WIMG_WCOMB);
-	printf("wifi: %u: the memory begins %#llx, the image %#llx\n", step, dsp_memory[0], segment_word(0, 0));
 	for (unsigned s = 0; s < image.segments; s++) {
-		volatile uint64_t *to = dsp_memory + image.segment[s].at / 8;
+		uint32_t length = (image.segment[s].memory_size + 7) & ~7u;
 
-		if ((image.segment[s].at | image.segment[s].memory_size) & 7) {
-			printf("wifi: %u: a segment that does not begin and end at a multiple of eight bytes: not written\n", step);
+		if (image.segment[s].at & 0x7) {
+			printf("wifi: %u: a segment that does not begin on eight bytes: not written\n", step);
 			return false;
 		}
 		printf("wifi: %u: about to write %#x bytes at %#x (%#x of them the file's)\n", step, image.segment[s].memory_size,
@@ -1899,27 +2019,41 @@ step_image(void)
 		snprintf(last_write, sizeof(last_write), "step %u wrote a segment of the image at %#x", step,
 		    WPSS_MEMORY + image.segment[s].at);
 		hold(true);
-		for (uint32_t i = 0; i < image.segment[s].memory_size; i += 8) {
-			to[i / 8] = segment_word(s, i);
+		for (uint32_t from = 0; from < length; from += window) {
+			/*
+			 * (The kernel's pages are 16K and a segment may begin on any 4K: the window is mapped
+			 * from the page it begins in, and written from the right place in it.)
+			 */
+			uint32_t piece = length - from < window ? length - from : window;
+			uint64_t phys = (uint64_t)WPSS_MEMORY + image.segment[s].at + from;
+			uint64_t base = trunc_page(phys), offset = phys - base, span = round_page(offset + piece);
+			vm_offset_t mapped = ml_io_map_unmappable(base, span, VM_WIMG_WCOMB);
+			volatile uint64_t *to = (volatile uint64_t *)(mapped + offset);
+
+			if (mapped == 0) {
+				printf("wifi: %u: the DSP's memory at %#llx cannot be mapped\n", step, phys);
+				return false;
+			}
+			for (uint32_t i = 0; i < piece; i += 8) {
+				to[i / 8] = segment_word(s, from + i);
+			}
+			settle();
+			for (uint32_t i = 0; i < piece; i += 8) {
+				wrong += to[i / 8] != segment_word(s, from + i);
+			}
+			ml_io_unmap(mapped, span);
 		}
 		written += image.segment[s].file_size;
 		cleared += image.segment[s].memory_size - image.segment[s].file_size;
 	}
-	settle();
-	for (unsigned s = 0; s < image.segments; s++) {
-		volatile uint64_t *from = dsp_memory + image.segment[s].at / 8;
-
-		for (uint32_t i = 0; i < image.segment[s].memory_size; i += 8) {
-			wrong += from[i / 8] != segment_word(s, i);
-		}
-	}
 	printf("wifi: %u: %llu bytes written and %llu cleared; read back, %llu words of eight bytes differ\n", step, written, cleared,
 	    wrong);
-	settle();
-	ml_io_unmap((vm_offset_t)dsp_memory, WPSS_MEMORY_SIZE);
 	image_written = wrong == 0;
 	return image_written;
 }
+
+#define ITEM_GLINK_DESCRIPTOR   478             /* (GLINK's items: see "GLINK" below) */
+#define ITEM_GLINK_OUR_QUEUE    479
 
 /* ---- step 10: our SMP2P item --------------------------------------------------------------------------- */
 
@@ -1936,7 +2070,7 @@ static struct block smem_lock = { "shared memory's lock", 0x01f43000, 0x1000 };
 #define LOCK_US                 1u
 
 /* Our item made in the partition, as Linux's qcom_smem_alloc_private() makes one. False, and why said: not made. */
-static bool our_item_make_locked(uint32_t partition);
+static bool smem_make_locked(uint32_t partition, uint32_t item, uint32_t bytes);
 
 static bool
 our_item_make(uint32_t partition)
@@ -1944,17 +2078,29 @@ our_item_make(uint32_t partition)
 	bool made;
 
 	lck_mtx_lock(&redwood_smem_alloc_lock);
-	made = our_item_make_locked(partition);
+	made = smem_make_locked(partition, ITEM_SMP2P_OURS, sizeof(struct smp2p));
+	lck_mtx_unlock(&redwood_smem_alloc_lock);
+	return made;
+}
+
+/* Any item of ours in the partition, of `bytes` bytes (GLINK's, where the boot chain has not made them). */
+static bool
+smem_make(uint32_t partition, uint32_t item, uint32_t bytes)
+{
+	bool made;
+
+	lck_mtx_lock(&redwood_smem_alloc_lock);
+	made = smem_make_locked(partition, item, bytes);
 	lck_mtx_unlock(&redwood_smem_alloc_lock);
 	return made;
 }
 
 static bool
-our_item_make_locked(uint32_t partition)
+smem_make_locked(uint32_t partition, uint32_t item, uint32_t bytes)
 {
 	struct smem_partition header;
 	struct smem_entry entry;
-	const uint32_t item_size = (sizeof(struct smp2p) + 7) & ~7u, need = sizeof(entry) + item_size;
+	const uint32_t item_size = (bytes + 7) & ~7u, need = sizeof(entry) + item_size;
 	uint32_t owner = ~0u, at;
 	bool made = false;
 
@@ -1962,7 +2108,7 @@ our_item_make_locked(uint32_t partition)
 	printf("wifi: %u: about to take the lock (write %u at %#x, until it reads back so, for a second at most), write an entry "
 	    "of %u bytes for item %u with %u bytes behind it where the partition's items from the bottom end, move the "
 	    "partition's mark by %u, and release the lock (write 0)\n", step, LOCK_US, smem_lock.phys + LOCK_OWNER,
-	    (uint32_t)sizeof(entry), ITEM_SMP2P_OURS, item_size, need);
+	    (uint32_t)sizeof(entry), item, item_size, need);
 	snprintf(last_write, sizeof(last_write), "step %u took the shared memory's lock", step);
 	hold(true);
 	for (uint32_t ms = 0; ms <= 1000; ms++) {
@@ -1984,7 +2130,7 @@ our_item_make_locked(uint32_t partition)
 		goto out;
 	}
 	for (at = sizeof(header); at < header.free_uncached;) {
-		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.item == ITEM_SMP2P_OURS ||
+		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.item == item ||
 		    entry.size > header.size) {
 			break;
 		}
@@ -2000,9 +2146,9 @@ our_item_make_locked(uint32_t partition)
 		goto out;
 	}
 	/* the entry first, whole; only then the mark, in one store: nobody sees half of either */
-	smem_poke(partition + at, SMEM_CANARY | ITEM_SMP2P_OURS << 16);
+	smem_poke(partition + at, SMEM_CANARY | item << 16);
 	smem_poke(partition + at + 4, item_size);
-	smem_poke(partition + at + 8, item_size - (uint32_t)sizeof(struct smp2p));     /* padding behind the item; none in front */
+	smem_poke(partition + at + 8, item_size - bytes);     /* padding behind the item; none in front */
 	smem_poke(partition + at + 12, 0);
 	settle();
 	smem_poke(partition + __offsetof(struct smem_partition, free_uncached), at + need);
@@ -2018,7 +2164,7 @@ out:
 static bool
 step_our_item(void)
 {
-	static const char *const names[] = { OUR_ENTRY_STOP, OUR_ENTRY_RADIO };
+	const char *const names[] = { OUR_ENTRY_STOP, OUR_ENTRY_RADIO };
 	struct smem_partition header;
 	struct smp2p ours;
 	uint32_t cacheline = 0, size = 0, partition;
@@ -2080,6 +2226,27 @@ step_our_item(void)
 		return false;
 	}
 	show_words("our item reads back", &ours);
+	{
+		uint32_t got = 0;
+
+		if (smem_item(ITEM_GLINK_DESCRIPTOR, &got) == 0) {
+			/*
+			 * (miatoll's boot chain has not made GLINK's items with the modem, as redwood's makes them with
+			 * its Wi-Fi DSP: Linux's qcom_glink_smem_register() makes the descriptor and our queue itself
+			 * when they are not there -- 32 bytes and 16K -- and the remote side its own queue.)
+			 */
+			announce("make GLINK's descriptor (item 478, 32 bytes) and our queue (item 479, 16K), as Linux does when the "
+			    "boot chain has not");
+			if (!smem_make(partition, ITEM_GLINK_DESCRIPTOR, 32) || !smem_make(partition, ITEM_GLINK_OUR_QUEUE, 16384)) {
+				return false;
+			}
+			for (uint32_t at = 0, where = smem_item(ITEM_GLINK_DESCRIPTOR, &got); where != 0 && at < 32; at += 4) {
+				smem_poke(where + at, 0);
+			}
+			settle();
+			printf("wifi: %u: GLINK's descriptor and our queue made\n", step);
+		}
+	}
 
 	announce("see that our two marks in GLINK's descriptor are at zero before the DSP starts");
 	glink_reset();
@@ -2131,14 +2298,16 @@ step_start(void)
 	    "listened for, tell the always-on processor that the image is loaded, and ask TrustZone to authenticate it and let "
 	    "the DSP out of reset");
 	/* (nobody answered them, and a ring after the start is to be the DSP's) */
-	for (unsigned i = 0; i < 8 && (rang = rd(ipcc.base + IPCC_RECEIVED)) != IPCC_NOBODY; i++) {
+	for (unsigned i = 0; i < 8 && !dsp.apcs && (rang = rd(ipcc.base + IPCC_RECEIVED)) != IPCC_NOBODY; i++) {
 		put(&ipcc, "heard", IPCC_CLEAR, rang);
 	}
 	/* (the boot chain listens for the DSP's GLINK ring and no other: without this an SMP2P ring leaves no trace) */
-	put(&ipcc, "listened for", IPCC_ENABLE, IPCC_WPSS << 16 | IPCC_SMP2P);
+	if (!dsp.apcs) {
+		put(&ipcc, "listened for", IPCC_ENABLE, IPCC_WPSS << 16 | IPCC_SMP2P);
+	}
 	bzero(&doorbell, sizeof(doorbell));
 	lck_mtx_lock(&dsp_lock);
-	if (!mailbox_send("{class: image, res: load_state, name: wpss, val: on}")) {
+	if (!mailbox_send_image("on")) {
 		lck_mtx_unlock(&dsp_lock);
 		return false;
 	}
@@ -2148,7 +2317,7 @@ step_start(void)
 	image_written = false;                  /* (whatever the answer: the memory is not ours to look at now) */
 	if (result != 0 || answer != 0) {
 		printf("wifi: %u: TRUSTZONE DOES NOT START THE DSP: the call returns %d, its answer is %#llx\n", step, result, answer);
-		mailbox_send("{class: image, res: load_state, name: wpss, val: off}");
+		mailbox_send_image("off");
 		lck_mtx_unlock(&dsp_lock);
 		return false;
 	}
@@ -2242,16 +2411,12 @@ step_start(void)
  *
  * The DSP opens three channels, and we answer one: "IPCRTR", which carries QRTR (below).
  */
-#define ITEM_GLINK_DESCRIPTOR   478
-#define ITEM_GLINK_OUR_QUEUE    479
 #define ITEM_GLINK_THEIR_QUEUE  480
 #define GLINK_OUR_TAIL          0               /* the descriptor's words: how far the DSP has read our queue (its to move) */
 #define GLINK_OUR_HEAD          4               /* how far we have written it */
 #define GLINK_THEIR_TAIL        8               /* how far we have read the DSP's queue */
 #define GLINK_THEIR_HEAD        12              /* how far it has written it (its to move) */
 #define GLINK_RESERVE           16              /* of our queue, never filled (Linux's reserve, and room for one short message) */
-#define IPCC_GLINK              0u              /* the signal */
-
 enum {
 	GLINK_VERSION = 0, GLINK_VERSION_ACK = 1, GLINK_OPEN = 2, GLINK_CLOSE = 3, GLINK_OPEN_ACK = 4, GLINK_INTENT = 5,
 	GLINK_DONE = 6, GLINK_INTENT_REQUEST = 7, GLINK_INTENT_REQUEST_ACK = 8, GLINK_DATA = 9, GLINK_CLOSE_ACK = 11,
@@ -2398,7 +2563,7 @@ glink_put(const void *first, uint32_t first_length, const void *second, uint32_t
 	settle();
 	smem_poke(glink.descriptor + GLINK_OUR_HEAD, (head + padded) % glink.ours_size);
 	settle();
-	wr(ipcc.base + IPCC_SEND, IPCC_WPSS << 16 | IPCC_GLINK);
+	doorbell_ring(IPCC_WPSS << 16 | IPCC_GLINK);
 	glink.said++;
 	return true;
 }
@@ -2618,7 +2783,7 @@ glink_pump(void)
 		}
 		case GLINK_READ_NOTIFY:
 			glink_advance(length);
-			wr(ipcc.base + IPCC_SEND, IPCC_WPSS << 16 | IPCC_GLINK);
+			doorbell_ring(IPCC_WPSS << 16 | IPCC_GLINK);
 			break;
 		case GLINK_CLOSE:
 			glink_advance(length);
@@ -4140,6 +4305,7 @@ redwood_wifi_quiesce(void)
 }
 
 #define REDWOOD_SOC_BASE        0x00400000ul    /* where the loader says the phone's peripherals begin (its "redwood") */
+#define MIATOLL_SOC_BASE        0x00100000ul    /* ... and miatoll's */
 
 extern vm_offset_t pe_arm_get_soc_base_phys(void);
 
@@ -4255,6 +4421,44 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 	thread_terminate(current_thread());
 }
 
+/* wifi_step=N: steps 1 to N, each said; the DSP stopped at the end, or left as asked. Returns the last done. */
+static uint32_t
+numbered_steps(void)
+{
+	uint32_t done = 0;
+
+	for (step = 1; step <= last_step; step++) {
+		if (!steps[step - 1]()) {
+			printf("wifi: step %u: FAILED; the steps after it are not attempted\n", step);
+			break;
+		}
+		printf("wifi: step %u: done\n", step);
+		done = step;
+	}
+	step = done;
+	new_from = STEPS + 1;                   /* (what follows has been announced) */
+	steps_over(done);
+	printf("wifi: over after step %u; %s\n", done, last_write);
+	return done;
+}
+
+static void
+numbered_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	for (unsigned waited = 0; waited < 600 && rootvnode == NULLVP; waited++) {
+		sleep_ms(200);
+	}
+	uint32_t back = 0;
+
+	printf("wifi: the root file system is %s: the steps begin\n", rootvnode != NULLVP ? "there" : "STILL NOT THERE after two minutes");
+	numbered_steps();
+	if (PE_parse_boot_argn("wifi_return", &back, sizeof(back)) && back) {
+		printf("wifi: back to the loader (wifi_return)\n");
+		loader_return();
+	}
+	thread_terminate(current_thread());
+}
+
 /*
  * Called while the system starts, before there is a root file system. With wifi_step=N the start
  * waits until the steps are over (see redwood_adreno_init()); with wifi=1 it does not.
@@ -4274,7 +4478,19 @@ redwood_wifi_init(void)
 		printf("wifi: wifi=%u is not understood: wifi=1 turns the radio on, wifi_step=N goes the first N steps of that\n", on);
 		return;
 	}
-	if (pe_arm_get_soc_base_phys() != REDWOOD_SOC_BASE) {
+	if (pe_arm_get_soc_base_phys() == MIATOLL_SOC_BASE) {
+		dsp_profile_miatoll();
+		if (last_step == 0) {
+			printf("wifi: miatoll: the radio's driver is not there yet; wifi_step=%u goes as far as there is: the modem "
+			    "started, and QRTR with it\n", dsp.last);
+			return;
+		}
+		if (last_step > dsp.last) {
+			last_step = dsp.last;
+		}
+		aoss.size = 0x1000;             /* (dt: qcom,qmp-aop@c300000, msgram 0x1000) */
+		printf("wifi: miatoll: %s\n", dsp.name);
+	} else if (pe_arm_get_soc_base_phys() != REDWOOD_SOC_BASE) {
 		if (last_step != 0 && PE_parse_boot_argn("wifi_lx", &back, sizeof(back)) && back) {
 			/* a check of what is under the driver: it gets as far as finding no firmware to talk to */
 			printf("wifi: this is not the phone; with wifi_lx the driver is started all the same, for what it does before "
@@ -4327,18 +4543,15 @@ redwood_wifi_init(void)
 			new_from = known_from;
 		}
 	}
-	for (step = 1; step <= last_step; step++) {
-		if (!steps[step - 1]()) {
-			printf("wifi: step %u: FAILED; the steps after it are not attempted\n", step);
-			break;
+	if (dsp.apcs) {
+		/* (miatoll: the steps go beside the system's start, on a thread, once the root is there) */
+		if (kernel_thread_start(numbered_thread, NULL, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+			printf("wifi: the steps wait for the root file system on a thread of their own; the system goes on starting\n");
 		}
-		printf("wifi: step %u: done\n", step);
-		done = step;
+		return;
 	}
-	step = done;
-	new_from = STEPS + 1;                   /* (what follows has been announced) */
-	steps_over(done);
-	printf("wifi: over after step %u; %s\n", done, last_write);
+	done = numbered_steps();
 	back = 0;
 	if (PE_parse_boot_argn("wifi_return", &back, sizeof(back)) && back) {
 		printf("wifi: back to the loader (wifi_return)\n");
