@@ -3,6 +3,9 @@
 # iOS SDK; XNU_SRC is the kernel tree (xnu/apply.sh creates it).
 DARWIN_REDWOOD=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 export DARWIN_REDWOOD
+# The C locale for every tool the builds run: in some (tr_TR) the range [a-zA-Z] leaves out "i", and the
+# sed in tcsh's build, among others, then silently drops every name that has one
+export LC_ALL=C
 export THEOS=${THEOS:-$HOME/theos}
 export XNU_SRC=${XNU_SRC:-$DARWIN_REDWOOD/xnu-src/xnu-8796.121.2}
 export XNUDEPS=$DARWIN_REDWOOD/xnu-deps
