@@ -546,6 +546,11 @@ static const char *const redwood_driver_args[] = {
 	"touchscreen", "buttons", "cpufreq", "ddr", "battery", "haptic", "torch", "cam", "speaker_probe",
 	"display_probe", "ufs_native", NULL
 };
+/* miatoll's: the same, but buttons= stays -- that driver tells the two phones apart by the SoC base itself */
+static const char *const miatoll_driver_args[] = {
+	"touchscreen", "cpufreq", "ddr", "battery", "haptic", "torch", "cam", "speaker_probe",
+	"display_probe", "ufs_native", NULL
+};
 
 static const struct platform platform_qemu_virt = {
 	.name = "qemu-virt", .io_base = 0x08000000, .io_size = 0x08000000,
@@ -586,7 +591,7 @@ static const struct platform platform_miatoll = {
 	.small_cores = 0x3f,
 	/* cont_splash_memory in the phone's device tree, "Display Reserved" in miatollPkg's memory map */
 	.fb_base = 0x9C000000,
-	.drop_args = redwood_driver_args,
+	.drop_args = miatoll_driver_args,
 	/*
 	 * Not redwood's 0xF0000000: on a 4 GB phone that splits the only stretch of RAM long enough for
 	 * the kernel and the system image (0xC0000000-0x17E000000). Here it is in the block below it.

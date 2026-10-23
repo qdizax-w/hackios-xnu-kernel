@@ -152,6 +152,21 @@ struct peripheral {
 static struct peripheral pon = { .name = "the PMK8350's power-on block", .id = 0x013 };          /* registers 0x1300 of slave 0 */
 static struct peripheral pin = { .name = "GPIO6 of the PM7325", .id = 0x18d };                   /* registers 0x8d00 of slave 1 */
 
+/*
+ * miatoll (Redmi Note 9S and its siblings, SM7125): the same arbiter at the same addresses (dt:
+ * qcom,spmi@c440000, qcom,ee 0), other chips. Power and volume down are KPDPWR and RESIN of the
+ * PM6150's power-on block (dt: qcom,power-on@800 of qcom,pm6150@0) -- an older one than the
+ * PMK8350's "HLOS" block, whose status has KPDPWR in bit 0 and RESIN in bit 1 (Linux:
+ * pm8941-pwrkey.c, PON_KPDPWR_N_SET, PON_RESIN_N_SET); volume up is GPIO2 of the PM6150L (dt:
+ * gpio_keys, vol_up: <&pm6150l_gpios 2 ACTIVE_LOW>, pinctrl@c000 of qcom,pm6150l@4: GPIO n's
+ * registers at 0xc000 + 0x100 * (n - 1)), with the GPIO layout of the PM7325's.
+ */
+#define MIATOLL_SOC_BASE        0x00100000ul    /* where the loader says miatoll's peripherals begin */
+#define REDWOOD_SOC_BASE        0x00400000ul    /* ... and redwood's */
+extern vm_offset_t pe_arm_get_soc_base_phys(void);
+static uint8_t pon_kpdpwr = 0x80, pon_resin = 0x40;     /* (PON_KPDPWR, PON_RESIN below: redwood's) */
+static uint8_t pon_subtype_low = 0x09, pon_subtype_high = 0x09;
+
 /* How the reads have gone: said once a minute. */
 static struct {
 	uint64_t reads, failed, total_ns, longest_ns, last_ns;
@@ -336,8 +351,8 @@ buttons_poll(void)
 	if (power.usable || volume_down.usable) {
 		problem = spmi_read(&pon, REG_RT_STATUS, &status, 1);
 		if (problem == NULL) {
-			button_look(&power, status & PON_KPDPWR);
-			button_look(&volume_down, status & PON_RESIN);
+			button_look(&power, status & pon_kpdpwr);
+			button_look(&volume_down, status & pon_resin);
 		} else if (said < 8) {
 			said++;
 			printf("buttons: reading %s: %s\n", pon.name, problem);
@@ -396,12 +411,12 @@ pon_inputs(void)
 		return;
 	}
 	printf("buttons: power-on block: status %#x (power %s, volume down %s); interrupts: edge %#x, high %#x, low %#x, "
-	    "enabled %#x, latched %#x, pending %#x\n", r[0], (r[0] & PON_KPDPWR) ? "HELD" : "released",
-	    (r[0] & PON_RESIN) ? "HELD" : "released", r[REG_INT_SET_TYPE - REG_RT_STATUS], r[REG_INT_POLARITY_HIGH - REG_RT_STATUS],
+	    "enabled %#x, latched %#x, pending %#x\n", r[0], (r[0] & pon_kpdpwr) ? "HELD" : "released",
+	    (r[0] & pon_resin) ? "HELD" : "released", r[REG_INT_SET_TYPE - REG_RT_STATUS], r[REG_INT_POLARITY_HIGH - REG_RT_STATUS],
 	    r[REG_INT_POLARITY_LOW - REG_RT_STATUS], r[REG_INT_ENABLED - REG_RT_STATUS], more[0], more[1]);
 	power.usable = volume_down.usable = true;
-	power.last = r[0] & PON_KPDPWR;
-	volume_down.last = r[0] & PON_RESIN;
+	power.last = r[0] & pon_kpdpwr;
+	volume_down.last = r[0] & pon_resin;
 }
 
 /* Step 4 for the pin: it is volume up only if it is an input with a pull-up, and switched on. */
@@ -480,7 +495,7 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	}
 
 	printf("buttons: step 3: the first transfers on the SPMI bus\n");
-	pon_known = identify(&pon, PON_TYPE, PON_SUBTYPE_HLOS, PON_SUBTYPE_HLOS);
+	pon_known = identify(&pon, PON_TYPE, pon_subtype_low, pon_subtype_high);
 	pin_known = identify(&pin, GPIO_TYPE, GPIO_SUBTYPE_LV, GPIO_SUBTYPE_MV_VIN3);
 	if (steps < 4) {
 		goto out;
@@ -544,9 +559,23 @@ redwood_buttons_init(void)
 	if (!PE_parse_boot_argn("buttons", &enabled, sizeof(enabled))) {
 		uint32_t touch_screen = 0;
 
-		enabled = PE_parse_boot_argn("touchscreen", &touch_screen, sizeof(touch_screen)) && touch_screen != 0;
+		enabled = (PE_parse_boot_argn("touchscreen", &touch_screen, sizeof(touch_screen)) ||
+		    PE_parse_boot_argn("ft8756", &touch_screen, sizeof(touch_screen))) && touch_screen != 0;
 	}
 	if (!enabled) {
+		return;
+	}
+	if (pe_arm_get_soc_base_phys() == MIATOLL_SOC_BASE) {
+		pon.name = "the PM6150's power-on block";
+		pon.id = 0x008;                 /* registers 0x800 of slave 0 */
+		pin.name = "GPIO2 of the PM6150L";
+		pin.id = 0x4c1;                 /* registers 0xc100 of slave 4 */
+		pon_kpdpwr = 0x01;
+		pon_resin = 0x02;
+		pon_subtype_low = 0x01;         /* (whichever of the older blocks it is: step 3 says) */
+		pon_subtype_high = 0x05;
+	} else if (pe_arm_get_soc_base_phys() != REDWOOD_SOC_BASE) {
+		printf("buttons: not a phone this driver knows: nothing is read\n");
 		return;
 	}
 	PE_parse_boot_argn("buttons_steps", &steps, sizeof(steps));
