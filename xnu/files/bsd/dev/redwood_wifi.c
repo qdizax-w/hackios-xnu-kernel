@@ -2894,7 +2894,8 @@ glink_send(const void *data, uint32_t length)
 #define QRTR_US                 1u
 #define QRTR_CONTROL            0xfffffffeu     /* the control port */
 #define QRTR_FIRST_PORT         0x4000u         /* where Linux begins numbering ports that ask for no number */
-enum { QRTR_DATA = 1, QRTR_HELLO = 2, QRTR_BYE = 3, QRTR_NEW_SERVER = 4, QRTR_DEL_SERVER = 5, QRTR_DEL_CLIENT = 6, QRTR_RESUME_TX = 7 };
+enum { QRTR_DATA = 1, QRTR_HELLO = 2, QRTR_BYE = 3, QRTR_NEW_SERVER = 4, QRTR_DEL_SERVER = 5, QRTR_DEL_CLIENT = 6, QRTR_RESUME_TX = 7,
+	QRTR_EXIT = 8, QRTR_PING = 9, QRTR_NEW_LOOKUP = 10, QRTR_DEL_LOOKUP = 11 };
 
 struct qrtr_header {                            /* version 1, which Linux sends; version 2 is read as well */
 	uint32_t version, type, from_node, from_port, confirm, size, to_node, to_port;
@@ -3042,7 +3043,16 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
 			}
 		}
 		break;
+	case QRTR_NEW_LOOKUP:
+		/*
+		 * The other side asks who serves a service: what it waits for from us. Said, so that the
+		 * services it wants of the host are known (miatoll's modem: the locator, file services).
+		 */
+		printf("wifi: qrtr: NODE %u PORT %u LOOKS FOR service %u (%#x), version %u, instance %u\n", header->from_node,
+		    header->from_port, control->words[0], control->words[0], control->words[1] & 0xff, control->words[1] >> 8);
+		break;
 	default:
+		printf("wifi: qrtr: control message %u from node %u port %u\n", control->command, header->from_node, header->from_port);
 		break;                                  /* (a client's going, and what else there is: nothing here wants it) */
 	}
 }
