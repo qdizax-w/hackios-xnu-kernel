@@ -72,7 +72,7 @@
 
 #define GIC_SGI_SIGNAL          0           /* cpu_signal(): another processor wants this one's attention */
 #define GIC_SGI_STOP            1           /* psci_smp_stop_here(): the system is going back to the boot loader */
-#define GIC_INTID_VTIMER        27          /* EL1 virtual timer PPI */
+#define GIC_INTID_VTIMER_DEFAULT 27         /* EL1 virtual timer PPI, where ARM recommends it (SM7325) */
 #define GIC_INTID_SPI_MIN       32
 #define GIC_INTID_SPURIOUS_MIN  1020
 #define GIC_SPI_MOST            48          /* attached at a time */
@@ -81,6 +81,11 @@
 static vm_offset_t gicd_base, gicr_base;
 static vm_size_t   gicr_size;
 static vm_offset_t gicr_cpu_base[MAX_CPUS]; /* each processor's redistributor frame */
+/*
+ * The EL1 virtual timer's interrupt: the gic node's "vtimer-intid" when the loader gives one (SM7125
+ * has it on PPI 3 = INTID 19, as SDM845 and SC7180), 27 otherwise.
+ */
+static uint32_t gic_intid_vtimer = GIC_INTID_VTIMER_DEFAULT;
 
 /*
  * Acknowledged, not yet EOI'd; 0: none. The signal between processors is interrupt 0 and reads
@@ -310,7 +315,7 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 		}
 		gic_active_iar[cpu] = iar | GIC_IAR_TAKEN;
 
-		if (intid == GIC_INTID_VTIMER) {
+		if (intid == gic_intid_vtimer) {
 			/* same sequence as the FIQ path in sleh_fiq() */
 			getCpuDatap()->cpu_decrementer = -1; /* Large */
 			rtclock_intr(TRUE);
@@ -418,7 +423,7 @@ gic_v3_irq_cpu_init(void)
 {
 	int cpu = cpu_number();
 	vm_offset_t gicr;
-	uint32_t mine = 1u << GIC_INTID_VTIMER;
+	uint32_t mine;
 
 	if (gicd_base == 0) {
 		DTEntry entry;
@@ -433,6 +438,15 @@ gic_v3_irq_cpu_init(void)
 		uint64_t const *reg = prop;
 		vm_offset_t soc_base = pe_arm_get_soc_base_phys();
 
+		if (SecureDTGetProperty(entry, "vtimer-intid", &prop, &prop_size) == kSuccess &&
+		    prop_size == sizeof(uint32_t)) {
+			uint32_t intid = *(uint32_t const *)prop;
+
+			if (intid >= 16 && intid < 32) {        /* a PPI */
+				gic_intid_vtimer = intid;
+			}
+		}
+
 		simple_lock_init(&gic_spi_lock, 0);
 		gicd_base = ml_io_map(soc_base + reg[0], reg[1]);
 		gicr_base = ml_io_map(soc_base + reg[2], reg[3]);
@@ -443,6 +457,8 @@ gic_v3_irq_cpu_init(void)
 	} else if (gicr_cpu_base[cpu] != 0) {
 		return;
 	}
+
+	mine = 1u << gic_intid_vtimer;
 
 	/* System-register CPU interface */
 	__builtin_arm_wsr64("ICC_SRE_EL1", __builtin_arm_rsr64("ICC_SRE_EL1") | 1);
@@ -476,7 +492,7 @@ gic_v3_irq_cpu_init(void)
 	/* Virtual timer PPI (and those): Group 1 (IRQ), default priority, enabled */
 	gic_write32(gicr + GICR_IGROUPR0, gic_read32(gicr + GICR_IGROUPR0) | mine);
 	gic_write32(gicr + GICR_IGRPMODR0, gic_read32(gicr + GICR_IGRPMODR0) & ~mine);
-	*(volatile uint8_t *)(gicr + GICR_IPRIORITYR(GIC_INTID_VTIMER)) = GIC_PRIORITY_DEFAULT;
+	*(volatile uint8_t *)(gicr + GICR_IPRIORITYR(gic_intid_vtimer)) = GIC_PRIORITY_DEFAULT;
 	gic_write32(gicr + GICR_ISENABLER0, mine);
 
 	/* Distributor: affinity routing, Group 1 enabled (normally already so) */
@@ -502,7 +518,7 @@ gic_v3_irq_cpu_init(void)
 
 	ml_install_interrupt_handler(NULL, 0, NULL, gic_irq_handler, NULL);
 	kprintf("gic: v3, distributor %p, cpu %d's redistributor %p, virtual timer on PPI %d\n",
-	    (void *)gicd_base, cpu, (void *)gicr, GIC_INTID_VTIMER);
+	    (void *)gicd_base, cpu, (void *)gicr, gic_intid_vtimer);
 }
 
 #endif /* GENERIC_GIC_V3_IRQ */

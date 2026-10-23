@@ -217,6 +217,7 @@ redwood_input_init(void)
 	redwood_cpufreq_init();
 	redwood_virtio_input_init();
 	redwood_goodix_init();
+	miatoll_touch_init();
 	redwood_buttons_init();
 	redwood_battery_init();
 	redwood_ufs_init();
