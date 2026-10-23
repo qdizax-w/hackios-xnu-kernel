@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pack the redwood UEFI (with the hook that starts the XNU loader) and an optional payload
+Pack a phone's UEFI (redwood by default; with the hook that starts the XNU loader) and an optional payload
 into an Android boot image for `fastboot boot`.
 
   kernel = gzip(BootShim + UEFI FD + ["XNUP" container]) + DTB
@@ -14,12 +14,13 @@ usage: mkxnuimg.py [-p payload.bin] [-o out.img]
 
 Another device (common/devices/<name>.conf, read by common/build.sh) sets these in the environment:
   UEFI_TARGET   Mu-Silicium device name (default redwood)    UEFI_FD, DTB   files to use instead
+  MU_SILICIUM   the Mu-Silicium tree, relative to here (default Mu-Silicium)
   FD_BASE, FD_SIZE, PAYLOAD_BASE                              addresses from its UEFI port's memory map
 """
 import argparse, gzip, os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MU = os.path.join(HERE, 'Mu-Silicium')
+MU = os.path.join(HERE, os.environ.get('MU_SILICIUM') or 'Mu-Silicium')
 PREBUILT = os.path.join(HERE, 'prebuilt', 'uefi')
 def env_int(name, default):
     v = os.environ.get(name, '')
@@ -34,7 +35,10 @@ ap.add_argument('-o', '--output', default=os.path.join(HERE, 'xnu-redwood.img'))
 ap.add_argument('--mode', default='RELEASE')
 args = ap.parse_args()
 
-fd_path = os.environ.get('UEFI_FD') or os.path.join(MU, f'Build/{TARGET}Pkg/{args.mode}_CLANGPDB/FV/SILICIUM_UEFI.fd')
+fd_dir = os.path.join(MU, f'Build/{TARGET}Pkg/{args.mode}_CLANGPDB/FV')
+# (Mu-Silicium names it SILICIUM_UEFI.fd now, <TARGET>_UEFI.fd in releases up to 3.6)
+fd_path = os.environ.get('UEFI_FD') or next((os.path.join(fd_dir, f) for f in ('SILICIUM_UEFI.fd', f'{TARGET.upper()}_UEFI.fd')
+                                             if os.path.isfile(os.path.join(fd_dir, f))), os.path.join(fd_dir, 'SILICIUM_UEFI.fd'))
 if os.path.isfile(fd_path) and os.path.isdir(os.path.join(MU, 'BootShim')):
     shim_dir = os.path.join(MU, 'BootShim')
     for f in ('BootShim.elf', 'BootShim.bin'):
@@ -47,6 +51,14 @@ if os.path.isfile(fd_path) and os.path.isdir(os.path.join(MU, 'BootShim')):
              'dtb': os.path.join(MU, f'Resources/DTBs/{TARGET}.dtb'), 'ramdisk': os.path.join(MU, 'Resources/ramdisk'),
              'mkbootimg': os.path.join(MU, 'Resources/Scripts/mkbootimg.py')}
 else:
+    # prebuilt/uefi is redwood's UEFI and device tree: another phone needs its own build (or UEFI_FD and DTB)
+    if TARGET != 'redwood' and not (os.environ.get('UEFI_FD') and os.environ.get('DTB')):
+        sys.exit(f'mkxnuimg: no UEFI built for {TARGET} ({fd_path}), and prebuilt/uefi is redwood\'s: '
+                 f'build it (uefi/README.md: build_uefi.py -d {TARGET}) or set UEFI_FD and DTB')
+    # the prebuilt boot shim has these addresses built in (miatoll's are the same)
+    if (FD_BASE, FD_SIZE, PAYLOAD_BASE) != (0x9FD00000, 0x200000, 0xF0000000):
+        sys.exit('mkxnuimg: prebuilt/uefi/BootShim.bin is for FD_BASE=0x9FD00000 FD_SIZE=0x200000 '
+                 'PAYLOAD_BASE=0xF0000000: build the shim from a Mu-Silicium tree (uefi/README.md)')
     parts = {'shim': os.path.join(PREBUILT, 'BootShim.bin'), 'fd': os.path.join(PREBUILT, 'SILICIUM_UEFI.fd'),
              'dtb': os.path.join(PREBUILT, 'redwood.dtb'), 'ramdisk': os.path.join(PREBUILT, 'ramdisk'),
              'mkbootimg': os.path.join(PREBUILT, 'mkbootimg.py')}

@@ -1,7 +1,8 @@
 #!/bin/bash
 # xl — drive the XNU loader on the phone over USB (fastboot protocol).
 #
-#   xl enter            get the phone into the resident loader (from Android or stock fastboot)
+#   xl enter            get the phone into the resident loader (from Android or stock fastboot);
+#                       DEVICE=miatoll xl enter for another phone than redwood (its common/devices/ profile)
 #   xl run [N]          upload the current kernel, run it (optionally stop at checkpoint N), fetch the log
 #   xl ramdisk [FILE]   upload the big system image (default userland/system.apfs) once; it stays in
 #                       the phone's RAM across kernel runs and is the root filesystem (/dev/md0)
@@ -50,6 +51,16 @@ K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bc
 L=xnuloader/loader.efi
 [ -f $L ] || L=prebuilt/loader.efi
 mkdir -p logs
+# DEVICE=<name> (common/run.sh passes it on): the UEFI that `enter` boots is that profile's
+# (common/devices/<name>.conf); without it, redwood's
+if [ -n "$DEVICE" ]; then
+	[ -f "common/devices/$DEVICE.conf" ] || { echo "xl: no profile common/devices/$DEVICE.conf"; exit 1; }
+	# shellcheck disable=SC1090
+	. "common/devices/$DEVICE.conf"
+	export UEFI_TARGET UEFI_FD DTB FD_BASE FD_SIZE PAYLOAD_BASE MU_SILICIUM
+	# KERNEL=: a kernel of the profile's own instead of the one built here or prebuilt/
+	[ -n "$KERNEL" ] && K=$KERNEL
+fi
 # There is one phone, whichever working copy (tools/new-workspace.sh) talks to it: the locks are
 # outside all of them.
 PHONE=${XDG_RUNTIME_DIR:-/tmp}/hackios-phone
@@ -59,7 +70,9 @@ fb() { flock -w 90 $PHONE.lock timeout "${FB_TIMEOUT:-10}" fastboot "$@" 2>&1; }
 # does the loader answer while its kernel runs (0.5 and later)? an older one answers only when the run is over
 live_loader() { fb getvar version | grep -Eq 'version: 0\.([5-9]|[1-9][0-9])'; }
 in_fastboot() { fastboot devices 2>/dev/null | grep -q fastboot; }
-is_loader() { in_fastboot && fb getvar product | grep -q 'product: xnuloader'; }
+# the loader's USB serial is "xnuloader": seen in the device list without asking it anything (an answer
+# that comes late must not make `enter` take it for the phone's own fastboot and send it a boot image)
+is_loader() { fastboot devices 2>/dev/null | grep -q '^xnuloader' || { in_fastboot && fb getvar product | grep -q 'product: xnuloader'; }; }
 state() {
 	if is_loader; then echo loader
 	elif in_fastboot; then echo fastboot
