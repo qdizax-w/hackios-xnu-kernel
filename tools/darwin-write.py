@@ -35,17 +35,30 @@ import time
 import uuid
 
 NAME = 'darwin'
-TYPE = '7C3457EF-0000-11AA-AA11-00306543ECAC'          # Apple APFS
-UNIQUE = 'FD6854AD-24AA-4FC3-94FE-290116858D68'
+# The phone's darwin, as the port set it up on each (DEVICE=, as for xl; redwood when unset):
+#   redwood  entry 34 of unit 0, Apple's APFS type, made when the port was set up
+#   miatoll  entry 19 of unit 0, the end of what was userdata (shrunk with parted from OrangeFox on
+#            24 October 2026), parted's "Linux data" type; the same size as redwood's
+DEVICES = {
+    'redwood': dict(TYPE='7C3457EF-0000-11AA-AA11-00306543ECAC', UNIQUE='FD6854AD-24AA-4FC3-94FE-290116858D68',
+                    PARTN=34, FIRST=25374720, LAST=30617594),
+    'miatoll': dict(TYPE='0FC63DAF-8483-4772-8E79-3D69D8477DE4', UNIQUE='DED36DF0-2641-4A00-B525-2F880BAF96C5',
+                    PARTN=19, FIRST=9256960, LAST=14499834),
+}
+DEVICE = os.environ.get('DEVICE', 'redwood')
+if DEVICE not in DEVICES:
+    sys.exit('darwin-write.py: DEVICE=%s is not a phone with a darwin partition (%s)' % (DEVICE, ', '.join(DEVICES)))
+TYPE = DEVICES[DEVICE]['TYPE']
+UNIQUE = DEVICES[DEVICE]['UNIQUE']
 LUN = 0
-PARTN = 34
-FIRST = 25374720
-LAST = 30617594
+PARTN = DEVICES[DEVICE]['PARTN']
+FIRST = DEVICES[DEVICE]['FIRST']
+LAST = DEVICES[DEVICE]['LAST']
 BS = 4096
-BLOCKS = LAST - FIRST + 1                               # 5242875
+BLOCKS = LAST - FIRST + 1                               # 5242875 on both
 PROTECTED = 1374208                                     # rootfs.apfs: 5628755968 bytes, never written
 DEV = '/dev/block/by-name/darwin'
-NODE = '/dev/block/sda34'
+NODE = '/dev/block/sda%d' % PARTN
 TMP = '/data/local/tmp/darwin-write.img'
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -63,16 +76,29 @@ def log(line):
     print('darwin-write: ' + line)
 
 
+_root_shell = None
+
+
+def root_prefix():
+    """How to be root on the phone: su in a rooted Android; nothing in a recovery, whose shell is root already."""
+    global _root_shell
+    if _root_shell is None:
+        r = subprocess.run(['adb', 'shell', 'id -u'], capture_output=True, timeout=60)
+        _root_shell = r.stdout.decode(errors='replace').strip() == '0'
+    return '' if _root_shell else 'su -c '
+
+
 def phone(script, binary=False):
     """Run a script in the phone's root shell (on its standard input, as flash-fingerprint.sh does)."""
-    r = subprocess.run(['adb', 'shell', 'su -c sh'], input=script.encode(), capture_output=True, timeout=3600)
+    r = subprocess.run(['adb', 'shell', root_prefix() + 'sh'], input=script.encode(), capture_output=True, timeout=3600)
     if r.returncode != 0:
         raise Refused('the phone said %d: %s' % (r.returncode, (r.stdout + r.stderr).decode(errors='replace')[-400:]))
     return r.stdout if binary else r.stdout.decode(errors='replace')
 
 
 def phone_bytes(command):
-    r = subprocess.run(['adb', 'exec-out', 'su -c "%s"' % command], capture_output=True, timeout=600)
+    r = subprocess.run(['adb', 'exec-out', (root_prefix() + '"%s"' % command) if root_prefix() else command],
+                       capture_output=True, timeout=600)
     if r.returncode != 0:
         raise Refused('reading from the phone: exit %d' % r.returncode)
     return r.stdout

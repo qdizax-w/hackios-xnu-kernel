@@ -516,6 +516,26 @@ dt_end(struct dt_writer *w)
 /* ------------------------------------------------------------------------ */
 /* Platform description                                                     */
 
+/* The port's partition, darwin, as it was set up on a phone: what a write into it is checked against. */
+struct darwin_id {
+	uint64_t first, last;           /* its first and last LBA on logical unit 0 (blocks of 4096) */
+	efi_guid type, unique;
+};
+
+/* redwood's: entry 34, Apple's APFS type */
+static const struct darwin_id darwin_redwood = {
+	.first = 25374720ULL, .last = 30617594ULL,
+	.type = { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } },
+	.unique = { 0xfd6854ad, 0x24aa, 0x4fc3, { 0x94, 0xfe, 0x29, 0x01, 0x16, 0x85, 0x8d, 0x68 } },
+};
+
+/* miatoll's (the Redmi Note 9S it was made on): entry 19, the end of what was userdata, parted's "Linux data" type */
+static const struct darwin_id darwin_miatoll = {
+	.first = 9256960ULL, .last = 14499834ULL,
+	.type = { 0x0fc63daf, 0x8483, 0x4772, { 0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4 } },
+	.unique = { 0xded36df0, 0x2641, 0x4a00, { 0xb5, 0x25, 0x2f, 0x88, 0x0b, 0xaf, 0x96, 0xc5 } },
+};
+
 struct platform {
 	const char *name;
 	uint64_t io_base, io_size;       /* one window covering the SoC peripherals */
@@ -532,6 +552,7 @@ struct platform {
 	uint64_t payload_base;           /* the payload's address (mkxnuimg.py's PAYLOAD_BASE), 0: the default */
 	uint64_t usb_keep_below;         /* the USB driver's buffers must stay below this (its window above), 0: anywhere */
 	uint32_t vtimer_intid;           /* the EL1 virtual timer's GIC interrupt (gic node "vtimer-intid"), 0: the kernel's 27 */
+	const struct darwin_id *darwin;  /* the port's own partition on this phone, as its GPT has it; NULL: none */
 };
 
 /*
@@ -576,6 +597,7 @@ static const struct platform platform_redwood = {
 	 */
 	.small_cores = 0x0f,
 	.fb_base = 0xE1000000,
+	.darwin = &darwin_redwood,
 };
 
 static const struct platform platform_miatoll = {
@@ -601,6 +623,7 @@ static const struct platform platform_miatoll = {
 	.usb_keep_below = 0xC0000000,
 	/* the virtual timer is PPI 3 here (the DT's arm,armv8-timer: <1 1> <1 2> <1 3> <1 0>), as on SDM845 and SC7180 */
 	.vtimer_intid = 19,
+	.darwin = &darwin_miatoll,
 };
 
 /*
@@ -1540,10 +1563,8 @@ ufs_survey(void)
  * same partition, named the same, of the same size, in the same place, on logical unit 0.
  */
 #define BLOCK_WRITE_FIRST  2042368ULL                  /* darwin's blocks of 4096: past both cryptexes */
-#define BLOCK_DARWIN_FIRST 25374720ULL                 /* its first and last LBA of unit 0, as the GPT has them */
-#define BLOCK_DARWIN_LAST  30617594ULL
-#define BLOCK_DARWIN_TYPE  { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } }
-#define BLOCK_DARWIN_UNIQ  { 0xfd6854ad, 0x24aa, 0x4fc3, { 0x94, 0xfe, 0x29, 0x01, 0x16, 0x85, 0x8d, 0x68 } }
+#define BLOCK_DARWIN_FIRST PLAT->darwin->first         /* its first and last LBA of unit 0, as the GPT has them */
+#define BLOCK_DARWIN_LAST  PLAT->darwin->last
 
 /*
  * The partitions first, then the logical units they are on (BLOCK_PART_UNIT, named unit0, unit1,
@@ -1883,7 +1904,6 @@ block_tables(void)
 static int
 block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const struct loader_block_part *bp)
 {
-	static const efi_guid type = BLOCK_DARWIN_TYPE, uniq = BLOCK_DARWIN_UNIQ;
 	static const char name[] = "darwin";
 	const char *why = NULL;
 
@@ -1892,9 +1912,11 @@ block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const s
 			return 0;               /* another partition: nothing to say about it */
 		}
 	}
-	if (memcmp(&info->type_guid, &type, sizeof(type)) != 0) {
+	if (PLAT->darwin == NULL) {
+		why = "this phone has no darwin the port knows";
+	} else if (memcmp(&info->type_guid, &PLAT->darwin->type, sizeof(efi_guid)) != 0) {
 		why = "its type GUID is not the one it had";
-	} else if (memcmp(&info->unique_guid, &uniq, sizeof(uniq)) != 0) {
+	} else if (memcmp(&info->unique_guid, &PLAT->darwin->unique, sizeof(efi_guid)) != 0) {
 		why = "its unique GUID is not the one it had";
 	} else if (info->start_lba != BLOCK_DARWIN_FIRST || info->end_lba != BLOCK_DARWIN_LAST) {
 		why = "it does not begin and end where it did";

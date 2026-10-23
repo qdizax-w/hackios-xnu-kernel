@@ -76,8 +76,21 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm
  * bounds and the GUIDs of the partition besides (xnuloader/loader.c, BLOCK_WRITE_FIRST).
  */
 #define UFS_WRITE_FIRST    2042368ULL                  /* darwin's blocks of 4096 */
-#define UFS_DARWIN_FIRST   25374720ULL                 /* its first LBA on the unit, as the GPT has it */
-#define UFS_DARWIN_BLOCKS  5242875ULL
+#define UFS_DARWIN_FIRST   ufs_darwin_first()          /* its first LBA on the unit, as the GPT has it */
+#define UFS_DARWIN_BLOCKS  5242875ULL                  /* (on both phones) */
+
+/*
+ * Where darwin begins on each phone: redwood's entry 34; miatoll's entry 19, made on 24 October 2026
+ * from the end of userdata (xnuloader/loader.c, darwin_miatoll; tools/darwin-write.py). The loader
+ * says which phone this is by where its peripherals begin.
+ */
+extern vm_offset_t pe_arm_get_soc_base_phys(void);
+
+static uint64_t
+ufs_darwin_first(void)
+{
+	return pe_arm_get_soc_base_phys() == 0x00100000ul ? 9256960ULL : 25374720ULL;
+}
 
 struct loader_block_part {
 	char name[36];
