@@ -306,7 +306,17 @@ load_start(void)
  * left, with what is needed to vote for bandwidth on them -- only read. (membench=2 says the cores
  * together get no more from memory than one alone: 12 GB/s; nobody here votes for more.)
  */
-#define CMD_DB_PHYS             0x80860000UL
+#define CMD_DB_PHYS             cmd_db_phys()
+#define MIATOLL_SOC_BASE        0x00100000ul    /* where the loader says miatoll's peripherals begin (redwood_adreno.c) */
+
+extern vm_offset_t pe_arm_get_soc_base_phys(void);
+
+/* dt: reserved-memory cmd_db@80860000 on redwood; miatoll's is where its AOP says (redwood_adreno.c, step 1) */
+static vm_offset_t
+cmd_db_phys(void)
+{
+	return pe_arm_get_soc_base_phys() == MIATOLL_SOC_BASE ? 0x80820000UL : 0x80860000UL;
+}
 #define CMD_DB_SIZE             0x20000UL
 #define CMD_DB_BCM              5               /* the kind of resource in a slave's id: bus clock managers */
 
@@ -339,6 +349,21 @@ cpufreq_wanted(void)
 	uint32_t on = 0;
 
 	return PE_parse_boot_argn("cpufreq", &on, sizeof(on)) && on != 0;
+}
+
+/*
+ * miatoll's GPU (Adreno 618) does not vote for memory bandwidth through its GMU: Linux and the
+ * vendor's kgsl both vote for it from the processor (a618_build_bw_table: "the 618 GMU doesn't
+ * do bus scaling"). Without a vote the 3D core's reads stall in the cache and the bus interface
+ * (rbbm_status: UCHE, VBIF and CCU busy, nothing else) and it stops after a few hundred frames.
+ * So with gpu=1 there, the same vote as cpufreq=1 casts on redwood; the cores' clocks stay alone.
+ */
+static bool
+miatoll_gpu_wanted(void)
+{
+	uint32_t gpu = 0;
+
+	return pe_arm_get_soc_base_phys() == MIATOLL_SOC_BASE && PE_parse_boot_argn("gpu", &gpu, sizeof(gpu)) && gpu != 0;
 }
 
 static void
@@ -566,7 +591,7 @@ redwood_cpufreq_init(void)
 	if (enabled == 1) {
 		ddr_look();
 		ddr_slots();
-	} else if (enabled == 2 && cpufreq_wanted()) {
+	} else if (enabled == 2 && (cpufreq_wanted() || miatoll_gpu_wanted())) {
 		ddr_raise();
 	}
 	enabled = 0;

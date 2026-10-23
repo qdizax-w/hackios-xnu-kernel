@@ -315,7 +315,23 @@ struct adreno_soc {
 	uint64_t zap_memory;
 	bool a618;
 	uint32_t stream1;
+	/* what Mesa is told (dt: qcom,chipid) and where the GPU's two temperature sensors are (dt: gpuss-0/1-usr) */
+	uint64_t chip_id;
+	uint32_t tsens, tsens_first;
+	/*
+	 * dt: the GPU SMMU's attach-impl-defs, pairs of an offset in its global space and a value:
+	 * Qualcomm's arm-smmu.c writes them every time it powers an SMMU v2 up (qsmmuv2_device_reset)
+	 * -- its TLB, prefetch and miss queues. redwood's (a qsmmu-v500, skip-init) has none.
+	 */
+	const uint32_t *smmu_impl_defs;
+	uint32_t smmu_impl_def_count;
 	uint32_t ported;                /* the last step that has been looked at for this SoC */
+};
+
+/* dt: arm,smmu-kgsl@5040000 attach-impl-defs */
+static const uint32_t miatoll_smmu_impl_defs[] = {
+	0x6000, 0x2378, 0x6060, 0x1055, 0x678c, 0x8, 0x6794, 0x28, 0x6800, 0x6, 0x6900, 0x3ff, 0x6924, 0x204,
+	0x6928, 0x11000, 0x6930, 0x800, 0x6960, 0xffffffff, 0x6b64, 0x1a5551, 0x6b68, 0x9a82a382,
 };
 
 static const struct adreno_soc soc_redwood = {
@@ -330,7 +346,7 @@ static const struct adreno_soc soc_redwood = {
 	.gcc_measure_ctl = 0x62038, .gcc_measure_status = 0x6203c, .gcc_debug_mux_gpucc = 0x146, .gcc_debug_divider = 2,
 	.gpucc_debug_divider = 2, .gpucc_debug_div_mask = 0xf, .measure_clear = true,
 	.sel_cxo = 0x1b, .sel_cxo_aon = 0x0b, .sel_cx_gmu = 0x1a, .sel_gx_gmu = 0x11, .sel_ahb = 0x12, .sel_gx_gfx3d = 0x0d,
-	.zap_memory = 0x8b71a000, .stream1 = 1,
+	.zap_memory = 0x8b71a000, .stream1 = 1, .chip_id = 0x06030500, .tsens = 0x0c265000, .tsens_first = 1,
 	.ported = 22,
 };
 static const struct adreno_soc soc_miatoll = {
@@ -354,6 +370,10 @@ static const struct adreno_soc soc_miatoll = {
 	.sel_cxo = 0x0a, .sel_cxo_aon = 0x0b, .sel_cx_gmu = 0x19, .sel_gx_gmu = 0x10, .sel_ahb = 0x11, .sel_gx_gfx3d = 0x0c,
 	/* dt: pil_gpu_mem: gpu_region@93b15000, 0x2000; kgsl-iommu: gfx3d_user <0>, gfx3d_secure <2> */
 	.zap_memory = 0x93b15000, .a618 = true, .stream1 = 0,
+	/* dt: tsens0 (tsens@c222000, its readings at 0xc263000), sensors 13 and 14 */
+	.chip_id = 0x06010800, .tsens = 0x0c263000, .tsens_first = 13,
+	.smmu_impl_defs = miatoll_smmu_impl_defs,
+	.smmu_impl_def_count = sizeof(miatoll_smmu_impl_defs) / sizeof(miatoll_smmu_impl_defs[0]) / 2,
 	.ported = 22,
 };
 static const struct adreno_soc *soc = &soc_redwood;
@@ -1370,6 +1390,14 @@ step_gmu_memory(void)
 #define SMMU_CB_TLBSTATUS       0x7f4
 #define SMMU_SCTLR_ON           (1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 12) /* on; faults recorded, no interrupt */
 #define SMMU_TCR_39_BITS        (25u | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23)   /* one table of 4K pages, cached walks */
+/*
+ * ... and walks that do not go through the caches, outer shareable: Linux's io-pgtable-arm for an
+ * SMMU that is not coherent (cfg->coherent_walk false: IRGN0 = ORGN0 = 0, SH0 = 2). miatoll's GPU
+ * SMMU is not (dt: arm,smmu-kgsl@5040000 has no dma-coherent): a walk marked cacheable and inner
+ * shareable from its port waits on coherency that is not there. The tables are written out of
+ * this processor's caches anyway (space_commit()).
+ */
+#define SMMU_TCR_39_BITS_NC     (25u | 2u << 12 | 1u << 23)
 #define SMMU_TCR2               (1u | 1u << 4 | 7u << 15)       /* 36 bits of physical address, 16 of context tag */
 #define SMMU_MAIR0              0xf404ff44      /* Linux's: 0 uncached, 1 cached, 2 device */
 #define SMMU_FSR_ALL            0xc00001fe      /* every kind of fault, and "several" */
@@ -1610,7 +1638,7 @@ space_on(struct gpu_space *space, uint32_t match, uint32_t stream)
 	put(&smmu, "cba2r", smmu_page + SMMU_CBA2R(space->context), SMMU_CBA2R_64_BIT);
 	put(&smmu, "cbar", smmu_page + SMMU_CBAR(space->context), SMMU_CBAR_STAGE_1);
 	put(&smmu, "cb tcr2", context + SMMU_CB_TCR2, SMMU_TCR2);
-	put(&smmu, "cb tcr", context + SMMU_CB_TCR, SMMU_TCR_39_BITS);
+	put(&smmu, "cb tcr", context + SMMU_CB_TCR, soc->a618 ? SMMU_TCR_39_BITS_NC : SMMU_TCR_39_BITS);
 	put(&smmu, "cb ttbr0, low", context + SMMU_CB_TTBR0, (uint32_t)root);
 	put(&smmu, "cb ttbr0, high", context + SMMU_CB_TTBR0 + 4, (uint32_t)(root >> 32));
 	put(&smmu, "cb ttbr1, low", context + SMMU_CB_TTBR1, 0);
@@ -1979,6 +2007,9 @@ step_gmu_space(void)
 	if (!smmu_layout()) {
 		return false;
 	}
+	for (uint32_t i = 0; i < soc->smmu_impl_def_count; i++) {
+		put(&smmu, "attach-impl-def", soc->smmu_impl_defs[2 * i], soc->smmu_impl_defs[2 * i + 1]);
+	}
 	gmu_space_is_on = true;         /* whatever of it has been written by the time something fails is taken back */
 	return space_on(&gmu_space, GMU_MATCH, GMU_STREAM);
 }
@@ -2177,10 +2208,7 @@ static struct block pdc_seq = { "pdc seq", 0x0b490000, 0x10000 };   /* dt: qcom,
 #define LEGACY_RSCC_HIDDEN_DATA(n) (4 * (0x00e + 2 * (n)))     /* RSC_CMD_OFFSET 2 */
 #define LEGACY_RSCC_HIDDEN_ADDR(n) (4 * (0x00d + 2 * (n)))
 #define LEGACY_GMU_CX_GMU_WFI_CONFIG    GMU_WORD(0x5002)
-#define LEGACY_GMU_PWR_COL_INTER_FRAME_HYST GMU_WORD(0x50c1)
-#define LEGACY_GMU_PWR_COL_SPTPRAC_HYST GMU_WORD(0x50c2)
 #define LEGACY_GMU_CHIP         0x06018000      /* dt qcom,chipid 0x06010800, minor and patch in bits 15-8 */
-#define LEGACY_PWR_COL_HYST     0x000a1680
 #define LEGACY_FW_STARTED       0xbabeface
 
 static void
@@ -2258,15 +2286,17 @@ gmu_start_legacy(void)
 	put(&gmu, "ahb_fence_range_0", GMU_AHB_FENCE_RANGE_0, 1u << 31 | (0xa << 2) << 18 | 0x8a0);
 	put(&gmu, "hfi_sfr_addr", GMU_HFI_SFR_ADDR, LEGACY_GMU_CHIP);
 	put(&gmu, "pwr_col_cp_msg", GMU_PWR_COL_CP_MSG, (GMU_LOG_ADDRESS & 0xfffff000) | ((GMU_LOG_SIZE / 4096 - 1) & 0xff));
-	/* a6xx_gmu_power_config(), the idle level being IFPC (the 618 has the feature) */
+	/*
+	 * a6xx_gmu_power_config(), the idle level being "active": the 618 has IFPC, but with it the
+	 * GMU takes the 3D core's power away whenever it is idle between frames, and this driver
+	 * reads the core's registers (the ring's read pointer, at every submission) without the
+	 * fence and the requests kgsl wraps each access in -- a read of a core without power holds
+	 * the bus, and the whole phone with it. So, as on redwood: no collapse, inter-frame or SPTP.
+	 */
 	put(&gmu, "sys_bus_config", GMU_SYS_BUS_CONFIG, 1);
 	put(&gmu, "icache_config", GMU_ICACHE_CONFIG, 1);
 	put(&gmu, "dcache_config", GMU_DCACHE_CONFIG, 1);
 	put(&gmu, "pwr_col_inter_frame_ctrl", GMU_PWR_COL_INTER_FRAME_CTRL, 0x9c40400);
-	put(&gmu, "pwr_col_inter_frame_hyst", LEGACY_GMU_PWR_COL_INTER_FRAME_HYST, LEGACY_PWR_COL_HYST);
-	set(&gmu, "pwr_col_inter_frame_ctrl", GMU_PWR_COL_INTER_FRAME_CTRL, 3);        /* IFPC_ENABLE_MASK */
-	put(&gmu, "pwr_col_sptprac_hyst", LEGACY_GMU_PWR_COL_SPTPRAC_HYST, LEGACY_PWR_COL_HYST);
-	set(&gmu, "pwr_col_inter_frame_ctrl", GMU_PWR_COL_INTER_FRAME_CTRL, 5);        /* SPTP_ENABLE_MASK */
 	set(&gmu, "rpmh_ctrl", GMU_RPMH_CTRL, GMU_RPMH_CTRL_ALL);
 	/* a6xx_gmu_start() */
 	put(&gmu, "cx_gmu_wfi_config", LEGACY_GMU_CX_GMU_WFI_CONFIG, 0);
@@ -3280,6 +3310,82 @@ step_zap_load(void)
 
 /* ---- step 20: the 3D core's registers, its command processor started, its first command ------------------- */
 
+/*
+ * miatoll: the GPU's two ports on the memory NoC (dt: ad-hoc-bus, mas-qxm-gpu: qcom,qport 0x120
+ * and 0x121, qcom,prio 0, qcom,forwarding, qcom,ap-owned; fab-gem_noc: gem_noc-base 0x9680000,
+ * qcom,base-offset 0x2b000, qcom,qos-off 0x80). "ap-owned": the processor's bus driver, not the
+ * firmware, sets their QoS, and nothing else here would (msm_bus_noc_adhoc.c, noc_qos_init: in
+ * each port's MAINCTL_LOW the default priority, bits 6:4, and urgency forwarding, bit 3). The
+ * 3D core's requests are what stall on this phone (rbbm_status: the bus interface busy, no
+ * fault, and nothing frees it but the power going), so they are given what the vendor gives them.
+ */
+#define GEM_NOC_PHYS            0x09680000ul
+#define GEM_NOC_GPU_MAINCTL(port) (0x2b000 + 0x8 + 0x80 * (port))
+#define NOC_DFLT_PRIO           (7u << 4)
+#define NOC_URGFWD_EN           (1u << 3)
+
+static void
+gpu_noc_qos(void)
+{
+	vm_offset_t noc;
+
+	if (soc != &soc_miatoll) {
+		return;
+	}
+	noc = ml_io_map(GEM_NOC_PHYS, 0x3f000);
+	for (uint32_t port = 0x120; port <= 0x121; port++) {
+		uint32_t was = rd(noc + GEM_NOC_GPU_MAINCTL(port));
+
+		wr(noc + GEM_NOC_GPU_MAINCTL(port), (was & ~NOC_DFLT_PRIO) | NOC_URGFWD_EN);
+		printf("adreno: %u: the GPU's NoC port %#x: mainctl_low %#x, now %#x (priority 0, urgency forwarded)\n", step,
+		    port, was, rd(noc + GEM_NOC_GPU_MAINCTL(port)));
+	}
+}
+
+/*
+ * The 618's hardware clock gating, as kgsl and Linux turn it on before anything else of the 3D
+ * core (a6xx_hwcg_set; the table is kgsl's a615_hwcg_regs, word offsets in the 3D core, with
+ * its values): what the chip is made and validated to run with. Without it every block's clock
+ * runs free, a state no driver of Qualcomm's leaves it in while it draws.
+ */
+static const uint32_t a615_hwcg[] = {
+	0x000b0, 0x02222222, 0x000b4, 0x02222220, 0x000b8, 0x00000080, 0x000bc, 0x0000f3cf,
+	0x000c0, 0x02222222, 0x000c1, 0x02222222, 0x000c4, 0x22222222, 0x000c5, 0x22222222,
+	0x000c8, 0x22222222, 0x000c9, 0x22222222, 0x000cc, 0x00022222, 0x000cd, 0x00022222,
+	0x000e0, 0x77777777, 0x000e1, 0x77777777, 0x000e4, 0x77777777, 0x000e5, 0x77777777,
+	0x000e8, 0x77777777, 0x000e9, 0x77777777, 0x000ec, 0x00077777, 0x000ed, 0x00077777,
+	0x000d0, 0x11111111, 0x000d1, 0x11111111, 0x000d4, 0x11111111, 0x000d5, 0x11111111,
+	0x000d8, 0x11111111, 0x000d9, 0x11111111, 0x000dc, 0x00011111, 0x000dd, 0x00011111,
+	0x0010b, 0x22222222, 0x0010c, 0x22222222, 0x0010d, 0x22222222, 0x0010e, 0x00222222,
+	0x00110, 0x00000004, 0x0010f, 0x00000002, 0x000f0, 0x22222222, 0x000f4, 0x00002222,
+	0x000f8, 0x00002020, 0x000f9, 0x00002220, 0x000fa, 0x00002220, 0x000fb, 0x00002220,
+	0x00100, 0x00040f00, 0x00101, 0x00040f00, 0x00102, 0x00040f00, 0x00103, 0x00040f00,
+	0x00104, 0x05022022, 0x00105, 0x00005555, 0x00106, 0x00000011, 0x00107, 0x00445044,
+	0x00108, 0x04222222, 0x00114, 0x00222222, 0x00111, 0x00002222, 0x0010a, 0x00000000,
+	0x00116, 0x04104004, 0x00113, 0x00000000, 0x0011c, 0x00000000, 0x00109, 0x00004000,
+	0x00115, 0x00000200, 0x00112, 0x00002222, 0x00117, 0x00000002, 0x0011b, 0x00002222,
+	0x00118, 0x00000222, 0x00119, 0x00000111, 0x0011a, 0x00000555,
+};
+#define GMU_AO_GMU_CGC_MODE_CNTL        GMU_WORD(0x9309)
+#define GMU_AO_GMU_CGC_DELAY_CNTL       GMU_WORD(0x930a)
+#define GMU_AO_GMU_CGC_HYST_CNTL        GMU_WORD(0x930b)
+#define GMU_GX_SPTPRAC_CLOCK_CONTROL    GMU_WORD(0x0080)
+
+static void
+gpu_hwcg_on(void)
+{
+	put(&gmu, "ao_gmu_cgc_mode_cntl", GMU_AO_GMU_CGC_MODE_CNTL, 0x00000222);
+	put(&gmu, "ao_gmu_cgc_delay_cntl", GMU_AO_GMU_CGC_DELAY_CNTL, 0x00000111);
+	put(&gmu, "ao_gmu_cgc_hyst_cntl", GMU_AO_GMU_CGC_HYST_CNTL, 0x00000555);
+	/* (the SP and TP clocks off while their gating is written, and on again) */
+	put(&gmu, "gx_sptprac_clock_control", GMU_GX_SPTPRAC_CLOCK_CONTROL, rd(gmu.base + GMU_GX_SPTPRAC_CLOCK_CONTROL) & ~1u);
+	for (unsigned i = 0; i < sizeof(a615_hwcg) / sizeof(a615_hwcg[0]); i += 2) {
+		put(&gpu, "clock gating", GPU_WORD(a615_hwcg[i]), a615_hwcg[i + 1]);
+	}
+	put(&gmu, "gx_sptprac_clock_control", GMU_GX_SPTPRAC_CLOCK_CONTROL, rd(gmu.base + GMU_GX_SPTPRAC_CLOCK_CONTROL) | 1u);
+	put(&gpu, "rbbm_clock_cntl", RBBM_CLOCK_CNTL, 0x8aa8aa82);
+}
+
 static bool
 step_core_start(void)
 {
@@ -3289,6 +3395,10 @@ step_core_start(void)
 
 	if (!cx_ready() || !core_is_on || !core_space_is_on) {
 		return false;
+	}
+	gpu_noc_qos();
+	if (soc->a618) {
+		gpu_hwcg_on();
 	}
 	announce("write the 3D core's registers as Linux does before it starts the command processor: the first writes "
 	    "to the core itself");
@@ -3315,8 +3425,8 @@ step_core_start(void)
 	put64(&gpu, "uche_write_thru_base", UCHE_WRITE_THRU_BASE, 0x0001fffffffff000ull);
 	if (soc->a618) {
 		/* the GMEM's addresses as the cache sees them: 1 MB on, its 512 KB (the 650 family has none of this) */
-		put64(&gpu, "uche_gmem_range_min", GPU_WORD(0x0e0d), 0x100000);
-		put64(&gpu, "uche_gmem_range_max", GPU_WORD(0x0e0f), 0x100000 + 0x80000 - 1);
+		put64(&gpu, "uche_gmem_range_min", GPU_WORD(0x0e0b), 0x100000);
+		put64(&gpu, "uche_gmem_range_max", GPU_WORD(0x0e0d), 0x100000 + 0x80000 - 1);
 	}
 	put(&gpu, "uche_filter_cntl", UCHE_FILTER_CNTL, 0x804);
 	put(&gpu, "uche_cache_ways", UCHE_CACHE_WAYS, 0x4);
@@ -3802,7 +3912,7 @@ redwood_adreno_quiesce(void)
  * (redwood_gpu_recover() below, which says what is done and which source says so). Without it
  * such a submission is only reported, and the GPU stays stopped.
  */
-#define GPU_CHIP_ID             0x06030500ull   /* dt: qcom,chipid */
+#define GPU_CHIP_ID             soc->chip_id    /* dt: qcom,chipid */
 #define GPU_ADDRESSES_START     0x20000000ull   /* above everything the steps use; below 4 GB, as Linux keeps them */
 #define GPU_ADDRESSES_SIZE      0xe0000000ull
 #define GPU_FENCE_AT            0x40            /* in the scratch page */
@@ -3969,8 +4079,10 @@ bool
 redwood_gpu_parameter(uint32_t which, uint64_t *value)
 {
 	switch (which) {
+	case 0x06:                              /* GMEM_BASE: Linux's 1 MB below the 650 family (step 20's GMEM range) */
+		*value = soc->a618 ? 0x100000 : 0;
+		return true;
 	case 0x01:                              /* GPU_ID: none, the chip ID says it */
-	case 0x06:                              /* GMEM_BASE */
 	case 0x08:                              /* PP_PGTABLE */
 	case 0x09:                              /* FAULTS */
 	case 0x0a:                              /* SUSPENDS */
@@ -3998,8 +4110,8 @@ redwood_gpu_parameter(uint32_t which, uint64_t *value)
 	case 0x12:                              /* UBWC_SWIZZLE */
 		*value = 6;
 		return true;
-	case 0x13:                              /* MACROTILE_MODE */
-		*value = 1;
+	case 0x13:                              /* MACROTILE_MODE: Linux's a6xx_calc_ubwc_config, none for the 618 */
+		*value = soc->a618 ? 0 : 1;
 		return true;
 	case 0x0e:                              /* VA_START */
 	case 0x0f:                              /* VA_SIZE */
@@ -4268,6 +4380,74 @@ redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t co
 	return gpu_fence;
 }
 
+/* The physical address an address of the 3D core's is at (0: not mapped), by its own tables. */
+static uint64_t
+space_lookup(struct gpu_space *space, uint64_t address)
+{
+	uint64_t entry = space->root != NULL ? space->root[address >> 30 & 0x1ff] : 0;
+
+	for (unsigned level = 2; level <= 3; level++) {
+		uint64_t *table = NULL;
+
+		if ((entry & 3) != 3) {
+			return 0;
+		}
+		for (uint32_t i = 0; i < space->table_count && table == NULL; i++) {
+			if (space->tables[i].phys == (entry & PTE_ADDRESS)) {
+				table = space->tables[i].table;
+			}
+		}
+		if (table == NULL) {
+			return 0;
+		}
+		entry = table[address >> (level == 2 ? 21 : 12) & 0x1ff];
+	}
+	return (entry & 3) == 3 ? (entry & PTE_ADDRESS) | (address & 0xfff) : 0;
+}
+
+/*
+ * The words of the first command buffer around where the command processor has got to: the
+ * buffer's size is in the ring, beside its address; what is left of it, in a register. (The
+ * processor reads ahead of what it runs, so the packet it is stuck on is somewhere before.)
+ */
+static void
+gpu_report_commands(void)
+{
+	uint64_t base = (uint64_t)rd(gpu.base + CP_IB1_BASE + 4) << 32 | rd(gpu.base + CP_IB1_BASE), at;
+	uint32_t rest = rd(gpu.base + CP_IB1_REM_SIZE), size = 0;
+	const uint32_t *ring_words = (const uint32_t *)core_ring.memory;
+
+	for (uint32_t i = 0; i + 2 < RING_WORDS && size == 0; i++) {
+		if (ring_words[i] == (uint32_t)base && ring_words[i + 1] == (uint32_t)(base >> 32)) {
+			size = ring_words[i + 2] & 0xfffff;
+		}
+	}
+	if (size == 0 || rest > size) {
+		printf("adreno: gpu:   the first command buffer is not in the ring (%u words to go)\n", rest);
+		return;
+	}
+	at = base + 4ull * (size - rest);
+	printf("adreno: gpu:   it is %u words long; the processor has read up to word %u (%#llx); the 96 words before:\n",
+	    size, size - rest, at);
+	for (uint64_t line = (at - 4 * 96 > base ? at - 4 * 96 : base) & ~31ull; line < at + 32; line += 32) {
+		static uint64_t page_phys;
+		static vm_offset_t page;
+		uint32_t words[8];
+
+		for (unsigned i = 0; i < 8; i++) {
+			uint64_t phys = space_lookup(&core_space, line + 4 * i);
+
+			if (phys != 0 && (phys & ~0xfffull) != page_phys) {
+				page_phys = phys & ~0xfffull;
+				page = ml_io_map_wcomb(page_phys, 4096);        /* (once per hang: the mapping is not given back) */
+			}
+			words[i] = phys != 0 ? *(volatile uint32_t *)(page + (phys & 0xfff)) : 0xdeaddead;
+		}
+		printf("adreno: gpu:   %#llx: %08x %08x %08x %08x %08x %08x %08x %08x\n", line, words[0], words[1], words[2],
+		    words[3], words[4], words[5], words[6], words[7]);
+	}
+}
+
 /* A submission does not come back: what the 3D core and its SMMU context say. */
 void
 redwood_gpu_report(const char *why)
@@ -4282,11 +4462,16 @@ redwood_gpu_report(const char *why)
 	printf("adreno: gpu:   in the first command buffer at %#llx, %u words to go; in the second at %#llx, %u to go\n",
 	    (uint64_t)rd(gpu.base + CP_IB1_BASE + 4) << 32 | rd(gpu.base + CP_IB1_BASE), rd(gpu.base + CP_IB1_REM_SIZE),
 	    (uint64_t)rd(gpu.base + CP_IB2_BASE + 4) << 32 | rd(gpu.base + CP_IB2_BASE), rd(gpu.base + CP_IB2_REM_SIZE));
+	gpu_report_commands();
+	printf("adreno: gpu:   the SMMU's global fault status %#x (syndrome %#x %#x)\n", rd(smmu.base + SMMU_SGFSR),
+	    rd(smmu.base + SMMU_SGFSR + 8), rd(smmu.base + SMMU_SGFSR + 12));
 	step = 0;
 	if (space_faulted(&core_space)) {
 		wr(smmu.base + context + SMMU_CB_FSR, SMMU_FSR_ALL);    /* so that the next one shows */
 	}
 }
+
+static bool gpu_restart_whole(void);
 
 /*
  * boot-arg gpu_recover=1: the 3D core is put back where step 20 and step 21 left it, and
@@ -4356,6 +4541,9 @@ redwood_gpu_recover(void)
 	gpu_recoveries++;
 	step = 0;                               /* (the steps are over: no line of theirs waits for the loader any more) */
 	newest_step = ~0u;
+	if (soc->gmu_legacy) {
+		return gpu_restart_whole();
+	}
 
 	wr(gpu.base + CP_SQE_CNTL, 3);
 	wr(gmu.base + GMU_PWR_COL_KEEPALIVE, 1);
@@ -4430,6 +4618,58 @@ static bool(*const steps[])(void) = {
 };
 #define STEPS                   ((uint32_t)(sizeof(steps) / sizeof(steps[0])))
 
+/*
+ * The 615 family's way back from a 3D core that has stopped answering (miatoll's 618, with
+ * gpu_recover=1: a request stuck out on the NoC when the CX half loses its power has been seen to
+ * take the whole phone with it, USB and all, so not by default). Resetting the core's own half is not enough on it: what
+ * hangs is a request out on its bus, and the bus interface sits in the CX half, which stays busy
+ * after a GX reset and lets the command processor fetch nothing (seen: status 0xc00015, the
+ * ring never read). kgsl's answer for this GPU is the whole block off and on again
+ * (adreno_reset: a6xx_gmu_suspend, then a start from nothing), and that is what is done here:
+ * gpu_block_stop(), the same as at the end of a run, takes the CX half's power and with it the
+ * bus interface, the SMMU and the GMU; then steps 1 to 21 again, as at boot. The 3D core's page
+ * tables are memory of ours and outlive it, so every buffer a program has stays where it was;
+ * what the steps make anew -- the ring, the microcode, the scratch page, the GMU's memory -- is
+ * put back at the same addresses. Everything submitted is then given up as done, as below.
+ */
+static bool
+gpu_restart_whole(void)
+{
+	uint64_t began = mach_absolute_time(), took;
+
+	printf("adreno: gpu: the whole GPU block is restarted (the 615 family's recovery, as kgsl's adreno_reset)\n");
+	core_stuck = true;
+	gpu_block_stop();
+	core_stuck = false;
+	ring_at = ring_sent = 0;
+	hfi_number = 0;
+	gmu_block_count = 0;
+	for (step = 1; step <= 21; step++) {
+		if (skip_steps & 1u << step) {
+			continue;
+		}
+		if (!steps[step - 1]()) {
+			printf("adreno: gpu: THE GPU DOES NOT COME BACK: step %u fails on the way; it is given up for this run\n", step);
+			step = 0;
+			quiet = true;
+			return false;
+		}
+	}
+	step = 0;
+	if (boot_oob_is_set) {
+		oob_clear(OOB_BOOT_SLUMBER);    /* (as when the GPU was first kept) */
+	}
+	bzero((void *)core_scratch.memory, 4096);
+	*(volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT) = gpu_fence;
+	to_memory(core_scratch.memory, 4096);
+	gpu_timed = gpu_fence;
+	quiet = true;
+	absolutetime_to_nanoseconds(mach_absolute_time() - began, &took);
+	printf("adreno: gpu: THE GPU IS BACK after %llu ms (%u time%s in this run); submissions up to %u are given up as done\n",
+	    took / NSEC_PER_MSEC, gpu_recoveries, gpu_recoveries == 1 ? "" : "s", gpu_fence);
+	return true;
+}
+
 /* ---- beside the steps: how warm the GPU is ------------------------------------------------------------------ */
 
 /*
@@ -4441,7 +4681,7 @@ static bool(*const steps[])(void) = {
  * sensor caught between two readings has none for a moment and is asked again; one that still
  * has none is put down as -273.0.
  */
-static struct block tsens = { "tsens1", 0x0c265000, 0x200 };
+static struct block tsens = { "tsens", 0x0c265000, 0x200 };     /* (the SoC's: see struct adreno_soc) */
 #define TSENS_STATUS(sensor)    (0xa0 + 4 * (sensor))
 #define TSENS_VALID             (1u << 21)
 
@@ -4457,7 +4697,7 @@ redwood_adreno_minute(void)
 	for (unsigned i = 0; i < 2; i++) {
 		tenths[i] = -2730;
 		for (unsigned again = 0; again < 16 && tenths[i] == -2730; again++) {
-			uint32_t status = rd(tsens.base + TSENS_STATUS(1 + i));
+			uint32_t status = rd(tsens.base + TSENS_STATUS(soc->tsens_first + i));
 
 			if (status & TSENS_VALID) {
 				tenths[i] = (int32_t)(status << 20) >> 20;
@@ -4621,14 +4861,19 @@ extern vm_offset_t pe_arm_get_soc_base_phys(void);
 static bool
 start_by_itself(void)
 {
-	static const char *const files[] = { "a660_gmu.bin", "a660_sqe.fw", "a660_zap.mdt", "a660_zap.b02" };
-	const char *missing = NULL;
+	const char *files[4], *missing = NULL;
 	uint64_t size;
 
-	if (pe_arm_get_soc_base_phys() != REDWOOD_SOC_BASE) {
-		printf("adreno: THE GPU IS NOT STARTED: gpu=1 is for the phone, and this is not it\n");
+	if (pe_arm_get_soc_base_phys() == MIATOLL_SOC_BASE) {
+		soc = &soc_miatoll;
+	} else if (pe_arm_get_soc_base_phys() != REDWOOD_SOC_BASE) {
+		printf("adreno: THE GPU IS NOT STARTED: gpu=1 is for the phones, and this is not one\n");
 		return false;
 	}
+	files[0] = soc->fw_gmu;
+	files[1] = soc->fw_sqe;
+	files[2] = soc->fw_zap_mdt;
+	files[3] = soc->fw_zap_b02;
 	image_asked_quietly = true;
 	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]) && missing == NULL; i++) {
 		if (image_file("fw", files[i], &size) == NULL) {
@@ -4670,7 +4915,12 @@ redwood_adreno_init(void)
 		}
 		by_itself = true;
 		last_step = 21;
-		skip_steps = 1u << 10 | 1u << 11 | 1u << 12;
+		/*
+		 * (miatoll: TrustZone does not come back from step 19's first call unless steps 11 and 12
+		 * have asked it their questions first, as in every run of the steps that got through; so
+		 * nothing is left out there)
+		 */
+		skip_steps = soc == &soc_miatoll ? 0 : 1u << 10 | 1u << 11 | 1u << 12;
 		pause_ms = 0;
 		watch_seconds = 0;
 		keep = 1;
@@ -4696,6 +4946,7 @@ redwood_adreno_init(void)
 		gbif.phys = soc->gpu + 4 * 0x3c00;
 		cx_misc.phys = soc->cx_misc;
 		rscc.phys = soc->rscc;
+		tsens.phys = soc->tsens;
 		gmu_hfi_address = 0x60100000u;          /* kgsl_gmu.c: the second megabyte from 0x60000000 */
 		gmu_log_address = 0x60300000u;          /* ... the fourth (after the crash dump's) */
 		gmu_log_size = 0x1000u;                 /* LOGMEM_SIZE */
@@ -4739,6 +4990,14 @@ redwood_adreno_init(void)
 			PE_parse_boot_argn("gpu_recover", &gpu_recover, sizeof(gpu_recover));
 			/* before any client exists: gpu_address_span() must not change under a live buffer */
 			PE_parse_boot_argn("gpu_va", &gpu_va, sizeof(gpu_va));
+			if (boot_oob_is_set) {
+				/*
+				 * Linux's a6xx_hw_init, at its end for a legacy GMU: "take the GMU out of its
+				 * special boot mode". The 3D core's own request (0) stays; boot_oob_is_set
+				 * too, so that the end of the run still sends the GMU to slumber.
+				 */
+				oob_clear(OOB_BOOT_SLUMBER);
+			}
 			gpu_kept = true;
 			quiet = true;
 			printf("adreno: THE GPU STAYS ON for the system to draw with: the service RedwoodGPU\n");

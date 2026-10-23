@@ -94,10 +94,33 @@ pin_get(unsigned pin)
 	return rd(PIN_REGS(pin) + 4) & 1;
 }
 
+/*
+ * The chip says it has a report by pulling its line low, briefly: a look at the line every few
+ * milliseconds misses most of those, and with them the reports that a finger went down or came
+ * up. So the pin controller is to catch the falling edge itself and hold on to it in the pin's
+ * interrupt status (TLMM, pinctrl-msm.c: msm_gpio_irq_set_type; raw status kept, the interrupt
+ * itself left off: nothing reaches a processor), which is looked at and cleared here.
+ */
+#define TLMM_INTR_CFG           0x8
+#define TLMM_INTR_STATUS        0xc
+#define TLMM_INTR_FALLING       (1u << 1 | 2u << 2 | 1u << 4 | 3u << 5) /* polarity, edge, raw status, to the apps processors */
+
+static void
+interrupt_catch(void)
+{
+	wr(int_pin + TLMM_INTR_CFG, TLMM_INTR_FALLING);
+	wr(int_pin + TLMM_INTR_STATUS, 0);
+}
+
 static bool
 interrupt_pending(void)
 {
-	return !(rd(int_pin + 4) & 1);
+	bool caught = rd(int_pin + TLMM_INTR_STATUS) & 1;
+
+	if (caught) {
+		wr(int_pin + TLMM_INTR_STATUS, 0);
+	}
+	return caught || !(rd(int_pin + 4) & 1);
 }
 
 /* ---- SPI by hand -------------------------------------------------------------------------------------- */
@@ -472,8 +495,15 @@ touch_thread(__unused void *arg, __unused wait_result_t wr)
 		return;
 	}
 	printf("ft8756: touch screen ready (1080 x 2400)\n");
+	interrupt_catch();
 	for (;;) {
-		if (interrupt_pending()) {
+		bool any_down = false;
+
+		for (unsigned id = 0; id < MAX_POINTS; id++) {
+			any_down |= contact[id].down;
+		}
+		/* (and while a finger is down, every time: a lift whose report was missed is not left standing) */
+		if (interrupt_pending() || any_down) {
 			if (!report_read()) {
 				printf("ft8756: the chip lost its firmware: loading it again\n");
 				if (!chip_ready()) {
