@@ -143,7 +143,7 @@ common/new-device.sh <codename> path/to/device.dtb   # profile + loader platform
 ```
 
 Then follow [docs/PORTING.md](docs/PORTING.md): the UEFI port, the loader's platform description, the kernel's
-drivers, the firmware. Device profiles live in `common/devices/` (`redwood.conf`, `miatoll.conf`, `qemu-virt.conf`, `_template.conf`).
+drivers, the firmware. Device profiles live in `common/devices/` (`redwood.conf`, `miatoll.conf`, `qemu-virt.conf`, `_template.conf`). The Redmi Note 9S (miatoll) has a guide of its own, from a stock phone to iOS with USB internet: [docs/MIATOLL.md](docs/MIATOLL.md).
 
 ## How it works
 
