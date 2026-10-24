@@ -374,4 +374,5 @@ redwood_net_init(void)
 	PE_parse_boot_argn("net_trace", &net_trace, sizeof(net_trace));
 	PE_parse_boot_argn("net_names", &net_names, sizeof(net_names));
 	redwood_virtio_net_init();
+	redwood_usbnet_init();
 }

@@ -58,6 +58,7 @@ void redwood_net_init(void);            /* the links there are: each looks for i
 /* an Apple80211 request (SIOCGA80211, SIOCSA80211) for the interface of a radio: redwood_apple80211.c */
 errno_t redwood_apple80211_ioctl(u_long command, void *data);
 void redwood_virtio_net_init(void);     /* boot-arg virtio_net=1: QEMU's virtio network device */
+void redwood_usbnet_init(void);         /* boot-arg usbnet=1: the phone's USB port, a USB Ethernet adapter (miatoll) */
 #endif /* KERNEL */
 
 #endif /* _SYS_REDWOOD_NET_H_ */

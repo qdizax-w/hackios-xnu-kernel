@@ -166,6 +166,29 @@ str_eq(const char *a, const char *b)
 	return *a == *b;
 }
 
+/* Is `word` one of the space-separated words of `line`? */
+static int
+has_word(const char *line, const char *word)
+{
+	while (*line) {
+		const char *a = line, *b = word;
+
+		while (*a && *a != ' ' && *a == *b) {
+			a++, b++;
+		}
+		if (*b == 0 && (*a == 0 || *a == ' ')) {
+			return 1;
+		}
+		while (*line && *line != ' ') {
+			line++;
+		}
+		while (*line == ' ') {
+			line++;
+		}
+	}
+	return 0;
+}
+
 /*
  * Set once the loader takes commands over USB: its log travels that way, and
  * the screen is left to the kernel (and to "oem screenshot").
@@ -2335,6 +2358,8 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 	uint64_t daif = 0, group1 = 0, started, last_pet, last_battery, last_beat_at, last_beat = 0, noted = 0;
 	int64_t status;
 	int arrived = 0, watching_only = 0;
+	/* usbnet=1: the kernel takes the USB port for an Ethernet link of its own (redwood_usbnet.c): hands off it */
+	int usb_kernels = has_word(((const struct boot_args *)(uintptr_t)boot_args_pa)->commandLine, "usbnet=1");
 
 	running_live = live;
 	running_slide = slide;
@@ -2429,7 +2454,9 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		if (block_enabled) {
 			block_poll();
 		}
-		usb_poll_command();
+		if (!usb_kernels) {
+			usb_poll_command();
+		}
 		if (block_enabled) {
 			/*
 			 * The pause is spent looking at the kernel's mailbox: with one look a pass, a
