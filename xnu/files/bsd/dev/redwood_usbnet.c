@@ -13,6 +13,11 @@
  * The first version of this ran on the same phone in the ios-miatoll port (sweet_usb.c).
  *
  * After such a run the loader cannot take the port back: put the phone into fastboot by hand.
+ *
+ * Nor can it hand out the log or a screenshot meanwhile, so the kernel does, over the cable: TCP port
+ * 5140 answers a line "log" with the console log as it stands and "screen" with the panel's memory
+ * (a line "WIDTH HEIGHT ROWBYTES", then the rows, BGRX), each after a line with its length in bytes.
+ * `xl log` and `xl screenshot` ask there when the phone is on the cable.
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
@@ -22,8 +27,11 @@
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
 #include <net/ethernet.h>
+#include <netinet/in.h>
 #include <pexpert/pexpert.h>
 #include <sys/kpi_mbuf.h>
+#include <sys/kpi_socket.h>
+#include <sys/socket.h>
 #include <sys/redwood_net.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
@@ -96,22 +104,23 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm
 #define UD_TRB_OUT      0x1000          /* ep0 OUT */
 #define UD_TRB_IN       0x1010          /* ep0 IN */
 #define UD_TRB_RX       0x1020          /* bulk OUT: computer -> phone */
-#define UD_TRB_TX       0x1030          /* bulk IN: phone -> computer */
 #define UD_SETUP        0x1040          /* the 8 bytes of a setup packet */
 #define UD_TRB_INT      0x1050          /* interrupt IN: notifications */
 #define UD_DATA         0x1100          /* ep0's data stage */
 #define UD_NOTIFY       0x1300
+#define UD_TRB_TX       0x1400          /* bulk IN, phone -> computer: a TRB for each frame of a batch */
 #define UD_RX           0x2000          /* one frame received */
-#define UD_TX           0x2800          /* one frame to send */
+#define UD_TX           0x4000          /* the frames of a batch, UD_FRAME_MAX apart */
 #define UD_FRAME_MAX    0x800
-#define UD_SIZE         0x4000
+#define UD_TX_BATCH     16              /* frames given to the controller in one transfer */
+#define UD_SIZE         0x10000
 
 /* physical endpoints: 2n OUT, 2n + 1 IN */
 #define EP_RX           2               /* 0x01 bulk OUT */
 #define EP_TX           3               /* 0x81 bulk IN */
 #define EP_INT          5               /* 0x82 interrupt IN */
 
-#define UD_TXQ          32              /* frames waiting for the cable */
+#define UD_TXQ          64              /* frames waiting for the cable */
 
 static struct {
 	vm_offset_t     dwc, dma;
@@ -437,26 +446,44 @@ ud_rx_done(void)
 	}
 }
 
-/* The next frame in the queue, if the IN endpoint is free. usbnet_lock held. */
+/*
+ * The frames in the queue, up to UD_TX_BATCH of them in one transfer, if the IN endpoint is free:
+ * a TRB each, so that each ends in a short packet of its own and the computer sees it as one frame;
+ * the last TRB ends the transfer and says so. usbnet_lock held.
+ */
 static void
 ud_tx_kick_locked(void)
 {
-	uint32_t len;
+	uint64_t tpa = ud.dma_pa + UD_TRB_TX;
+	unsigned n;
 
 	if (ud.tx_busy || ud.txq_count == 0 || !ud.configured) {
 		return;
 	}
-	len = ud.txq_len[ud.txq_head];
-	memcpy((void *)(ud.dma + UD_TX), ud.txq[ud.txq_head], len);
-	ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
-	ud.txq_count--;
-	/* a transfer of a multiple of 512 bytes would need a packet of none to end it: one byte more does it */
-	if (len % 512 == 0) {
-		((uint8_t *)(ud.dma + UD_TX))[len++] = 0;
+	n = ud.txq_count < UD_TX_BATCH ? ud.txq_count : UD_TX_BATCH;
+	for (unsigned i = 0; i < n; i++) {
+		volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_TX + 16 * i);
+		uint8_t *frame = (uint8_t *)(ud.dma + UD_TX + UD_FRAME_MAX * i);
+		uint32_t len = ud.txq_len[ud.txq_head];
+		uint64_t bpa = ud.dma_pa + UD_TX + UD_FRAME_MAX * i;
+
+		memcpy(frame, ud.txq[ud.txq_head], len);
+		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
+		/* a frame of a multiple of 512 bytes would need a packet of none to end it: one byte more does it */
+		if (len % 512 == 0) {
+			frame[len++] = 0;
+		}
+		t[0] = (uint32_t)bpa;
+		t[1] = (uint32_t)(bpa >> 32);
+		t[2] = len;
+		t[3] = TRBCTL_NORMAL | TRB_HWO | (i + 1 == n ? TRB_LST | TRB_IOC : 0);
+		ud_sync(UD_TX + UD_FRAME_MAX * i, len);
 	}
+	ud.txq_count -= n;
+	ud_sync(UD_TRB_TX, 16 * n);
 	ud.tx_busy = true;
-	ud.sent++;
-	ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, len, TRBCTL_NORMAL);
+	ud.sent += n;
+	ud_epcmd(EP_TX, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
 }
 
 /* en0's transmit (bsd/dev/redwood_net.c) */
@@ -603,6 +630,106 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
 	}
 }
 
+/* ---- the log and the screen, over the cable (port 5140) ---- */
+
+extern uint32_t loader_log_copy(char *out, uint32_t max);       /* osfmk/arm64/loader_return.c */
+extern bool loader_screen(const uint8_t **base, uint32_t *width, uint32_t *height, uint32_t *stride);
+
+#define UD_SERVE_PORT   5140
+#define UD_LOG_MAX      (1536 * 1024)
+
+static bool
+ud_send_all(socket_t so, const void *data, size_t n)
+{
+	const uint8_t *p = data;
+
+	while (n > 0) {
+		struct iovec iov = { .iov_base = (void *)(uintptr_t)p, .iov_len = n < 65536 ? n : 65536 };
+		struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+		size_t sent = 0;
+
+		if (sock_send(so, &msg, 0, &sent) != 0 || sent == 0) {
+			return false;
+		}
+		p += sent;
+		n -= sent;
+	}
+	return true;
+}
+
+static void
+ud_send_line(socket_t so, const char *line)
+{
+	(void)ud_send_all(so, line, strlen(line));
+}
+
+static void
+ud_answer(socket_t so, char *log)
+{
+	char request[64], line[64];
+	struct iovec iov = { .iov_base = request, .iov_len = sizeof(request) - 1 };
+	struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+	size_t got = 0;
+	const uint8_t *base;
+	uint32_t width, height, stride, n;
+
+	if (sock_receive(so, &msg, 0, &got) != 0 || got == 0) {
+		return;
+	}
+	request[got] = 0;
+	if (strncmp(request, "log", 3) == 0) {
+		n = loader_log_copy(log, UD_LOG_MAX);
+		snprintf(line, sizeof(line), "%u\n", n);
+		ud_send_line(so, line);
+		(void)ud_send_all(so, log, n);
+	} else if (strncmp(request, "screen", 6) == 0 && loader_screen(&base, &width, &height, &stride)) {
+		snprintf(line, sizeof(line), "%u %u %u\n", width, height, stride);
+		ud_send_line(so, line);
+		(void)ud_send_all(so, base, (size_t)stride * height);
+	} else {
+		ud_send_line(so, "0\n");
+	}
+}
+
+static void
+ud_serve(void *arg __unused, wait_result_t wr __unused)
+{
+	struct sockaddr_in at = { .sin_len = sizeof(at), .sin_family = AF_INET, .sin_port = htons(UD_SERVE_PORT) };
+	struct timeval patience = { .tv_sec = 20, .tv_usec = 0 };
+	socket_t listener = NULL, so;
+	vm_offset_t log;
+	int on = 1;
+
+	if (kmem_alloc(kernel_map, &log, UD_LOG_MAX, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		return;
+	}
+	for (;;) {
+		if (listener == NULL) {
+			if (sock_socket(PF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, NULL, &listener) != 0) {
+				listener = NULL;
+			} else if (sock_setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)),
+			    sock_bind(listener, (struct sockaddr *)&at) != 0 || sock_listen(listener, 2) != 0) {
+				sock_close(listener);
+				listener = NULL;
+			} else {
+				printf("usbnet: the log and the screen are on port %u\n", UD_SERVE_PORT);
+			}
+			if (listener == NULL) {
+				ud_sleep_ms(1000);
+				continue;
+			}
+		}
+		if (sock_accept(listener, NULL, 0, 0, NULL, NULL, &so) != 0) {
+			ud_sleep_ms(100);
+			continue;
+		}
+		sock_setsockopt(so, SOL_SOCKET, SO_SNDTIMEO, &patience, sizeof(patience));
+		sock_setsockopt(so, SOL_SOCKET, SO_RCVTIMEO, &patience, sizeof(patience));
+		ud_answer(so, (char *)log);
+		sock_close(so);
+	}
+}
+
 static const struct redwood_net_link ud_net_link = {
 	.name = "USB (CDC-ECM)",
 	.address = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 },
@@ -694,6 +821,9 @@ ud_start(void)
 		return false;
 	}
 	thread_deallocate(thread);
+	if (kernel_thread_start(ud_serve, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
 	return true;
 }
 

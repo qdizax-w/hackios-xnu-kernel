@@ -245,12 +245,40 @@ ramdisk() { # ramdisk [<file>|none]
 	printf '%s\t%s\t%s\n' "$(pwd)" "$1" "$size" > $PHONE.ramdisk 2>/dev/null
 }
 
+# A phone booted with usbnet=1 has the USB port for its own network (bsd/dev/redwood_usbnet.c): the loader
+# cannot be asked then, and the kernel answers over that network instead, TCP port 5140. Its address is the
+# one the computer's DHCP gave the phone's Ethernet address (02:00:5e:77:ee:02).
+phone_ip() {
+	local ip
+	ip=$(ip neigh 2>/dev/null | awk 'tolower($0) ~ /02:00:5e:77:ee:02/ && !/FAILED/ {print $1; exit}')
+	[ -z "$ip" ] && ip link 2>/dev/null | grep -qi 02:00:5e:77:ee:01 && ip=10.42.0.100   # (NetworkManager's first choice)
+	[ -n "$ip" ] && timeout 3 bash -c "exec 3<>/dev/tcp/$ip/5140" 2>/dev/null && echo "$ip"
+}
+net_ask() { # net_ask <ip> <log|screen> <file>: the answer's first line on stdout, the rest into the file
+	python3 - "$@" <<'PY'
+import socket, sys
+s = socket.create_connection((sys.argv[1], 5140), timeout=30)
+s.sendall(sys.argv[2].encode() + b"\n")
+f = s.makefile("rb")
+head = f.readline().decode().strip()
+with open(sys.argv[3], "wb") as out:
+    while chunk := f.read(1 << 20):
+        out.write(chunk)
+print(head)
+PY
+}
+
 screenshot() { # screenshot [file.png]
-	enter || return 1
-	local out=${1:-logs/screen.png} geom
-	geom=$(fb getvar screen | sed -n 's/^screen: //p')
-	[ -n "$geom" ] && fb oem screenshot | grep -q OKAY || { echo "xl: the loader has no display"; return 1; }
-	FB_TIMEOUT=60 fb get_staged logs/screen.raw >/dev/null
+	local out=${1:-logs/screen.png} geom ip
+	if ip=$(phone_ip); then
+		geom=$(net_ask "$ip" screen logs/screen.raw) && [ "$(echo $geom | wc -w)" = 3 ] ||
+			{ echo "xl: the phone ($ip) gave no screen"; return 1; }
+	else
+		enter || return 1
+		geom=$(fb getvar screen | sed -n 's/^screen: //p')
+		[ -n "$geom" ] && fb oem screenshot | grep -q OKAY || { echo "xl: the loader has no display"; return 1; }
+		FB_TIMEOUT=60 fb get_staged logs/screen.raw >/dev/null
+	fi
 	python3 - logs/screen.raw "$out" $geom <<'PY' && rm -f logs/screen.raw && echo "xl: $out ($geom)"
 import struct, sys, zlib
 raw, out, width, height, stride = sys.argv[1], sys.argv[2], *map(int, sys.argv[3:6])
@@ -297,7 +325,8 @@ sound) sound "$2" ;;
 ramdisk) ramdisk "$2" ;;
 run) run "oem run $2" "run${2:+-cp$2}" ;;
 selftest) run "oem selftest" selftest ;;
-log) enter && fb oem log >/dev/null && fetch_log logs/loader.log && cat logs/loader.log ;;
+log)	if ip=$(phone_ip); then net_ask "$ip" log logs/loader.log >/dev/null && cat logs/loader.log
+	else enter && fb oem log >/dev/null && fetch_log logs/loader.log && cat logs/loader.log; fi ;;
 stop) not_anothers_run stop && fb oem stop | grep -q OKAY && echo "xl: asked the kernel to come back" ;;
 memmap) enter && fb oem memmap >/dev/null && fb oem log >/dev/null && fetch_log logs/loader.log && sed -n '/^memory map/,$p' logs/loader.log ;;
 hang) enter && fb oem hang; echo "xl: waiting for the watchdog..."; t0=$(date +%s); wait_for android 150 && echo "xl: back in Android after $(( $(date +%s) - t0 )) s" || echo "xl: not back (state: $(state))" ;;

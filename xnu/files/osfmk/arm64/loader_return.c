@@ -26,6 +26,9 @@
 #include <pexpert/arm64/board_config.h>
 #include <vm/vm_page.h>
 #include <vm/vm_compressor.h>
+#include <console/video_console.h>
+
+extern struct vc_info vinfo;            /* osfmk/console/video_console.c: the boot framebuffer */
 
 /*
  * The console log handed back to the loader. A long session writes more than fits, and both
@@ -150,6 +153,48 @@ loader_log_put_locked(char c)
 			loader_log_len = LOADER_LOG_HEAD + loader_log_ring_at;
 		}
 	}
+}
+
+/*
+ * For whoever hands the log out while the kernel runs (bsd/dev/redwood_usbnet.c, over the network):
+ * a copy of it as it stands, oldest first, without putting the pieces in order in place. Returns the
+ * bytes copied. (Characters written meanwhile may tear the copy at one place; it is a look, not a record.)
+ */
+uint32_t
+loader_log_copy(char *out, uint32_t max)
+{
+	uint32_t n = 0, len = loader_log_len, at = loader_log_ring_at, take;
+
+	if (loader_log_linear || len <= LOADER_LOG_HEAD) {
+		take = len < max ? len : max;
+		__builtin_memcpy(out, loader_log, take);
+		return take;
+	}
+	take = LOADER_LOG_HEAD < max ? LOADER_LOG_HEAD : max;
+	__builtin_memcpy(out, loader_log, take);
+	n = take;
+	if (loader_log_wrapped && n < max) {
+		take = LOADER_LOG_RING - at < max - n ? LOADER_LOG_RING - at : max - n;
+		__builtin_memcpy(out + n, loader_log + LOADER_LOG_HEAD + at, take);
+		n += take;
+	}
+	take = at < max - n ? at : max - n;
+	__builtin_memcpy(out + n, loader_log + LOADER_LOG_HEAD, take);
+	return n + take;
+}
+
+/* ... and the panel's memory, for a screenshot the same way: false if there is no picture to give */
+bool
+loader_screen(const uint8_t **base, uint32_t *width, uint32_t *height, uint32_t *stride)
+{
+	if (vinfo.v_baseaddr == 0 || vinfo.v_depth != 32) {
+		return false;
+	}
+	*base = (const uint8_t *)vinfo.v_baseaddr;
+	*width = vinfo.v_width;
+	*height = vinfo.v_height;
+	*stride = vinfo.v_rowbytes;
+	return true;
 }
 
 /* Oldest first: the head, a note about what was dropped, then the ring from its oldest character. */
