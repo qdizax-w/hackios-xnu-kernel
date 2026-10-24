@@ -4,7 +4,10 @@
  *
  * The display is the framebuffer the boot loader left us (the one the kernel's text console
  * draws on). There is no hardware behind it that we drive: a "swap" copies the pixels of the
- * surfaces of its layers into that memory, and "vsync" is a timer.
+ * surfaces of its layers into that memory, and "vsync" is a timer -- or, on the phone with
+ * fb_scan=1, the panel's own scan (bsd/dev/redwood_display.c): then each frame is copied where
+ * the scan lets it land whole in one refresh (no tearing), the rate is the panel's (120 Hz), and
+ * the refresh notifications come when the panel's frames begin.
  *
  * The protocol (selectors and the layout of the swap request) was worked out from the
  * user-space side of iOS 16.5. Everything not implemented is logged once.
@@ -41,6 +44,16 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 #include "MiniIOSurface.h"
 
 extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
+/* the panel's scan (bsd/dev/redwood_display.c; sys/redwood_display.h, which iokit/ does not see) */
+struct redwood_display_scan {
+	int ok;
+	uint32_t lines, shown, millihz;
+	uint64_t line_ns, frame_ns;
+};
+extern "C" int redwood_display_scan_start(void);
+extern "C" const struct redwood_display_scan * redwood_display_scan(void);
+extern "C" int redwood_display_wait_lines(uint32_t first, uint32_t last, uint64_t limit_ns);
+extern "C" uint64_t redwood_display_next_frame_ns(void);
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -186,9 +199,15 @@ micros(uint64_t absolute)
 	return ns / 1000;
 }
 
+/* the panel's own rate, when its scan can be read and fb_hz= does not say otherwise (IOMobileFramebuffer::start) */
+static uint32_t gScanHz;
+
 static inline uint32_t
 refreshHz(void)
 {
+	if (gScanHz != 0) {
+		return gScanHz;
+	}
 	return gRefreshHz >= 1 && gRefreshHz <= 240 ? gRefreshHz : kFBRefreshHz;
 }
 static inline uint32_t
@@ -266,6 +285,8 @@ public:
 	 * their beat: neither a slow one nor a quick one then lands on the wrong side of it.
 	 */
 	uint64_t        fBeat;                  /* the beat the last frame was shown on */
+	uint64_t        fDrawNs;                /* (fb_scan) what putting the last frame into the panel's memory took */
+	uint32_t        fStatScanWaits, fStatScanMissed;        /* frames that waited for their place in the scan; that did not get it */
 	uint64_t        fReady;                 /* when the last frame was ready to be shown */
 	uint32_t        fStatOnBeat;            /* frames that waited for a refresh, and for how long together */
 	uint64_t        fStatBeatWait;
@@ -478,6 +499,16 @@ IOMobileFramebuffer::start(IOService * provider)
 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
 	/* for who draws with the GPU (userland/src/eagl.c): a frame need not be waited for before it is handed over */
 	setProperty("RedwoodWaitsForGPU", kOSBooleanTrue);
+	/* the panel's scan, if it can be read: its rate is then the one published, unless fb_hz= is given */
+	if (redwood_display_scan_start()) {
+		uint32_t hz;
+		const struct redwood_display_scan * scan = redwood_display_scan();
+
+		if (!PE_parse_boot_argn("fb_hz", &hz, sizeof(hz)) && scan != NULL) {
+			gScanHz = (scan->millihz + 500) / 1000;
+		}
+		IOLog("MiniIOMobileFramebuffer: frames follow the panel's scan, at %u a second\n", refreshHz());
+	}
 	publishModes();
 	setName("disp0");
 	registerService();
@@ -945,7 +976,37 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	fStatWaiting += mach_absolute_time() - began;
 	began = ready = mach_absolute_time();
-	if (gOnTheBeat) {
+	if (redwood_display_scan() != NULL) {
+		/*
+		 * Where the copy may start (fb_scan): every band of rows (fThreads of them, drawn side by side, each top
+		 * to bottom in about fDrawNs) has to stay behind the scan in this refresh -- written after the scan has
+		 * passed it, so it is first shown in the next -- and to be done before the next refresh's scan gets to
+		 * it. The last band starts below the scan and must not catch it up; the first must be done before the
+		 * scan comes round to its last row. That is a window of lines for the scan to be in when the copy starts:
+		 *   from  max(shown (n-1)/n, shown - D/line) and   up to  lines + shown/n - D/line.
+		 * Waited for, a frame and a half at most: a frame is never held longer than that for it.
+		 */
+		const struct redwood_display_scan * scan = redwood_display_scan();
+		uint64_t d = fDrawNs != 0 ? fDrawNs : scan->frame_ns / 3, dl = d / scan->line_ns;
+		uint32_t n = fThreads != 0 ? fThreads : 1, S = scan->shown, T = scan->lines;
+		uint64_t lo = (uint64_t) S * (n - 1) / n, hi = (uint64_t) T + S / n;
+
+		lo = S > dl && S - dl > lo ? S - dl : lo;
+		lo += 16;
+		hi = hi > dl + 16 ? hi - dl - 16 : 0;
+		if (hi > T) {
+			hi = T;
+		}
+		if (lo >= hi) {
+			lo = S;                         /* (a copy too slow for any window: at least start in the blanking) */
+			hi = T;
+		}
+		fStatScanWaits++;
+		if (!redwood_display_wait_lines((uint32_t) lo, (uint32_t) hi, scan->frame_ns * 3 / 2)) {
+			fStatScanMissed++;
+		}
+		fBeat = began = mach_absolute_time();
+	} else if (gOnTheBeat) {
 		uint64_t period, aim, next;
 
 		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
@@ -1043,6 +1104,8 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 	}
 	drawn = mach_absolute_time();
+	absolutetime_to_nanoseconds(drawn - began, &nanos);
+	fDrawNs = fDrawNs == 0 ? nanos : (fDrawNs * 7 + nanos) / 8;    /* (an average: one slow frame does not move the window) */
 	if (recorded != NULL) {
 		record(recorded);
 	}
@@ -1079,6 +1142,12 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
 		    fStatHeld, fStatLost, fStatSwapsLate);
 		fStatSwapsLate = 0;
+		if (fStatScanWaits != 0) {
+			IOLog("MiniIOMobileFramebuffer: the scan (fb_scan): %u frames started where it let them land whole, %u did not "
+			    "get there in time; %llu us to put a frame into the panel's memory\n", fStatScanWaits - fStatScanMissed,
+			    fStatScanMissed, fDrawNs / NSEC_PER_USEC);
+			fStatScanWaits = fStatScanMissed = 0;
+		}
 		for (different = 0; different < 8 && fStatSurfaces[different] != 0; different++) {
 		}
 		if (different == 8 && fStatFrames > 8) {
@@ -1237,6 +1306,15 @@ IOMobileFramebufferUserClient::armVSync(void)
 
 	/* one refresh after the last, not after whenever we got round to this: the rate does not drift */
 	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
+	if (redwood_display_scan() != NULL) {
+		/* fb_scan: when the panel's next frame begins, by its scan -- locked to it, never drifting */
+		uint64_t ahead;
+
+		nanoseconds_to_absolutetime(redwood_display_next_frame_ns(), &ahead);
+		fVSyncTime = now + (ahead != 0 ? ahead : period);
+		thread_call_enter_delayed(fVSyncCall, fVSyncTime);
+		return;
+	}
 	fVSyncTime += period;
 	if (fVSyncTime <= now || fVSyncTime > now + 2 * period) {
 		fVSyncTime = now + period;

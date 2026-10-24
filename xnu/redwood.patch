@@ -62,10 +62,10 @@ index a4d25040f38f..aad72993d139 100644
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..f93f2115d036 100644
+index 44274016a4cf..d0e1b0dc8b63 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,38 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,39 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -93,6 +93,7 @@ index 44274016a4cf..f93f2115d036 100644
 +bsd/dev/redwood_wifi.c		standard
 +bsd/dev/redwood_adsp.c		standard
 +bsd/dev/redwood_image.c		standard
++bsd/dev/redwood_display.c	standard
 +bsd/dev/redwood_virtio_blk.c	standard
 +bsd/dev/redwood_sparse.c	standard
 +bsd/dev/redwood_apfs_check.c	optional apfs
@@ -104,7 +105,7 @@ index 44274016a4cf..f93f2115d036 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +187,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +188,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -119,7 +120,7 @@ index 44274016a4cf..f93f2115d036 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +401,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +402,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -127,7 +128,7 @@ index 44274016a4cf..f93f2115d036 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +424,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +425,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -750,7 +751,7 @@ index 1d71c66629fb..3e1737c21b86 100644
  		/*
  		 * Update the new process's signature-dependent process state.
 diff --git a/bsd/kern/kern_memorystatus.c b/bsd/kern/kern_memorystatus.c
-index 1750d3a52d3c..9947cb2421da 100644
+index 1750d3a52d3c..9729a1fec84e 100644
 --- a/bsd/kern/kern_memorystatus.c
 +++ b/bsd/kern/kern_memorystatus.c
 @@ -222,6 +222,15 @@ MACRO_END
@@ -793,7 +794,54 @@ index 1750d3a52d3c..9947cb2421da 100644
  
  	/* Set the swapin trigger in pages based on the maximum size allocated for each c_seg */
  	memorystatus_swapin_trigger_pages = (unsigned int) atop_64(memorystatus_swapin_trigger_segments * c_seg_allocsize);
-@@ -5103,7 +5112,7 @@ memorystatus_pages_update(unsigned int pages_avail)
+@@ -4221,6 +4230,22 @@ memorystatus_idle_exit_from_VM(void)
+  * This is invoked for both advisory, non-fatal per-task high watermarks,
+  * as well as the fatal task memory limits.
+  */
++/* boot-arg memlimit_exempt=NAME (default PosterBoard; "none": nobody): see memorystatus_on_ledger_footprint_exceeded() */
++static boolean_t
++memorystatus_memlimit_exempt(proc_t p)
++{
++	static char name[MAXCOMLEN + 1];
++	static boolean_t read;
++
++	if (!read) {
++		if (!PE_parse_boot_argn("memlimit_exempt", name, sizeof(name))) {
++			strlcpy(name, "PosterBoard", sizeof(name));
++		}
++		read = TRUE;
++	}
++	return *p->p_name && strcmp(name, "none") != 0 && strncmp(name, p->p_name, sizeof(p->p_name)) == 0;
++}
++
+ void
+ memorystatus_on_ledger_footprint_exceeded(boolean_t warning, boolean_t memlimit_is_active, boolean_t memlimit_is_fatal)
+ {
+@@ -4244,6 +4269,23 @@ memorystatus_on_ledger_footprint_exceeded(boolean_t warning, boolean_t memlimit_
+ 	}
+ #endif /* VM_PRESSURE_EVENTS */
+ 
++	if (memlimit_is_fatal && memorystatus_memlimit_exempt(p)) {
++		/*
++		 * (the port's: a process named by boot-arg memlimit_exempt -- PosterBoard when not given -- keeps
++		 * going past its limit, which is lifted; what it had then is said once. RunningBoard gives the
++		 * wallpaper's process an iPhone's limit, and here Mesa and its buffers count against it: killed
++		 * within a second of every start, the wallpaper never appeared.)
++		 */
++		static int said;
++
++		if (said++ < 8) {
++			printf("memorystatus: %s [%d] goes past its limit of %d MB with %llu MB: the limit is lifted (memlimit_exempt)\n",
++			    p->p_name, proc_getpid(p), p->p_memstat_memlimit, get_task_phys_footprint(proc_task(p)) >> 20);
++		}
++		task_set_phys_footprint_limit_internal(proc_task(p), -1, NULL, memlimit_is_active, FALSE);
++		return;
++	}
++
+ 	if (memlimit_is_fatal) {
+ 		/*
+ 		 * If this process has no high watermark or has a fatal task limit, then we have been invoked because the task
+@@ -5103,7 +5145,7 @@ memorystatus_pages_update(unsigned int pages_avail)
  	if (critical || delta) {
  		unsigned int total_pages;
  
@@ -802,7 +850,7 @@ index 1750d3a52d3c..9947cb2421da 100644
  #if CONFIG_SECLUDED_MEMORY
  		total_pages -= vm_page_secluded_count;
  #endif /* CONFIG_SECLUDED_MEMORY */
-@@ -6609,7 +6618,7 @@ memorystatus_update_levels_locked(boolean_t critical_only)
+@@ -6609,7 +6651,7 @@ memorystatus_update_levels_locked(boolean_t critical_only)
  	}
  
  #if VM_PRESSURE_EVENTS
