@@ -80,3 +80,6 @@ __pycache__/
 !/xnu-deps/build/lzbitmap/libzbitmap.c
 !/xnu-deps/build/lzbitmap/libzbitmap.h
 /tools/android/f2fs-resize
+
+# SSH keys for the phone (userland/build.sh puts them on its data volume): never in the repository
+ssh/

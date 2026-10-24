@@ -7,6 +7,9 @@
 #   xl ramdisk [FILE]   upload the big system image (default userland/system.apfs) once; it stays in
 #                       the phone's RAM across kernel runs and is the root filesystem (/dev/md0)
 #                       ("xl ramdisk none" forgets it; the image sent with the kernel is then the root)
+#   xl ios              boot iOS for everyday use with the device's IOS_ARGS (miatoll: from the flash, USB
+#                       internet, settings kept): the image up, the run started in the background
+#                       (its output in logs/ios-run.log), the terminal free again
 #   xl screenshot [F]   save what is in the phone's framebuffer as a PNG (default logs/screen.png);
 #                       works during a run too (from another terminal)
 #   xl recording [F]    fetch the screen recording the last run made (rec_secs=N among XL_CMDLINE) and
@@ -268,6 +271,21 @@ print(head)
 PY
 }
 
+ios() {
+	[ -n "$IOS_ARGS" ] || { echo "xl: the profile ${DEVICE:-redwood} has no IOS_ARGS"; return 1; }
+	# the last one's run waits for a loader that is gone (the port was iOS's): it goes first
+	if [ -s logs/ios-run.pid ]; then
+		pkill -P "$(cat logs/ios-run.pid)" 2>/dev/null; kill "$(cat logs/ios-run.pid)" 2>/dev/null
+		rm -f logs/ios-run.pid; sleep 1
+	fi
+	enter && ramdisk "${IOS_IMAGE:-userland/flashboot.apfs}" || return 1
+	XL_SECS=${XL_SECS:-${IOS_SECS:-86400}} XL_CMDLINE="$BOOTARGS $IOS_ARGS${XL_CMDLINE:+ $XL_CMDLINE}" \
+		setsid "$0" run > logs/ios-run.log 2>&1 < /dev/null &
+	echo $! > logs/ios-run.pid
+	echo "xl: iOS is starting (about a minute to the home screen). Then: ssh miatoll, ./xl screenshot, ./xl log."
+	echo "xl: to leave, hold power and volume down until fastboot (the settings are saved on the way)."
+}
+
 screenshot() { # screenshot [file.png]
 	local out=${1:-logs/screen.png} geom ip
 	if ip=$(phone_ip); then
@@ -310,7 +328,7 @@ not_anothers_run() { # not_anothers_run <command>
 # While a run is in progress the loader takes only what does not disturb the kernel: state, screenshot,
 # log, stop, reboot. Anything else would wait for nothing.
 case "$1" in
-""|run|selftest|state|screenshot|log|stop|reboot) ;;
+""|run|selftest|state|screenshot|log|stop|reboot|ios) ;;
 *)	if ! flock -n $PHONE.run true 2>/dev/null; then
 		echo "xl: a run is in progress: only state, screenshot, log, stop and reboot now" >&2; exit 1
 	fi ;;
@@ -318,6 +336,7 @@ esac
 
 case "$1" in
 enter) enter && echo "xl: loader is up" ;;
+ios) ios ;;
 screenshot) screenshot "$2" ;;
 recording) recording "$2" ;;
 camera) camera "$2" ;;

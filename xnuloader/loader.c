@@ -573,6 +573,7 @@ struct platform {
 	uint64_t fb_base;                /* the framebuffer the firmware reports (GOP): it tells this device apart */
 	const char *const *drop_args;    /* boot-args the loader leaves out of the kernel's (see run_kernel), NULL: none */
 	uint64_t payload_base;           /* the payload's address (mkxnuimg.py's PAYLOAD_BASE), 0: the default */
+	const char *serial;              /* the serial number iOS shows (Settings, About), NULL: redwood's */
 	uint64_t usb_keep_below;         /* the USB driver's buffers must stay below this (its window above), 0: anywhere */
 	uint32_t vtimer_intid;           /* the EL1 virtual timer's GIC interrupt (gic node "vtimer-intid"), 0: the kernel's 27 */
 	const struct darwin_id *darwin;  /* the port's own partition on this phone, as its GPT has it; NULL: none */
@@ -629,7 +630,7 @@ static const struct platform platform_miatoll = {
 	 * Mu-Silicium's miatollPkg. The window starts at the global clock controller (0x00100000), below
 	 * redwood's 0x00400000: the kernel's redwood-only drivers tell the phones apart by that base.
 	 */
-	.name = "miatoll", .io_base = 0x00100000, .io_size = 0x3FF00000,
+	.name = "miatoll", .io_base = 0x00100000, .io_size = 0x3FF00000, .serial = "MIATOLL9S",
 	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
 	.cores = 8, .core_shift = 8,
 	/* Cores 0-5 are Cortex-A55s, 6-7 Cortex-A76s (capacity-dmips-mhz 1024 against 1740 in the DT) */
@@ -3254,8 +3255,21 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_identity(&w, identity_root, sizeof(identity_root) / sizeof(identity_root[0]), identity_root_data);
 	dt_prop_str(&w, "platform-name", "t8015");
 	/* what iBoot takes from the factory configuration of a real phone; fixed size fields */
-	dt_prop_padded(&w, "serial-number", "RDW00POCOX5P", 32);
-	dt_prop_padded(&w, "mlb-serial-number", "RDW00POCOX5PMLB00", 32);
+	{
+		const char *serial = PLAT->serial != NULL ? PLAT->serial : "RDW00POCOX5P";
+		char mlb[32];
+		int n = 0;
+
+		for (; serial[n] != 0 && n < 20; n++) {
+			mlb[n] = serial[n];
+		}
+		for (const char *tail = "MLB00"; *tail != 0; tail++) {
+			mlb[n++] = *tail;
+		}
+		mlb[n] = 0;
+		dt_prop_padded(&w, "serial-number", serial, 32);
+		dt_prop_padded(&w, "mlb-serial-number", mlb, 32);
+	}
 	dt_prop_padded(&w, "model-number", "MQAC2", 32);
 	dt_prop_padded(&w, "region-info", "LL/A", 32);
 	dt_prop_padded(&w, "regulatory-model-number", "A1865", 32);

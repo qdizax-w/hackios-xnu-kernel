@@ -306,6 +306,8 @@ now_text(char *text, size_t size, uint64_t now)
 	    (unsigned)(seconds / 3600 % 24), (unsigned)(seconds / 60 % 60), (unsigned)(seconds % 60), (unsigned)(micro / 1000));
 }
 
+extern void redwood_var_save_soon(void);        /* bsd/dev/redwood_ufs.c */
+
 static void
 button_look(struct button *b, bool pressed)
 {
@@ -338,6 +340,10 @@ button_look(struct button *b, bool pressed)
 		printf("buttons: %s released at %s, after %llu ms\n", b->name, when, held / NSEC_PER_MSEC);
 	}
 	redwood_touch_post(pressed ? REDWOOD_BUTTON_DOWN : REDWOOD_BUTTON_UP, b->record, 0, 0);
+	/* power and volume down together: on its way into fastboot -- the data volume while there is time */
+	if (pressed && power.down && volume_down.down) {
+		redwood_var_save_soon();
+	}
 }
 
 /* One look at both peripherals. */
