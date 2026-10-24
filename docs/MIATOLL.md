@@ -410,6 +410,7 @@ Not kept: temporary files, logs, and the `.deb` files apt downloaded.
 | The computer sees no new USB device | Check `journalctl -k -f` while iOS boots. A charge-only cable shows nothing. |
 | The adapter is there, but the phone gets no address | The firewall. `journalctl -f \| grep dnsmasq` must show DHCPDISCOVER; if it doesn't, see [the firewall](#linux-with-networkmanager). |
 | The phone has an address, but no internet | `nmcli connection show --active` must list `hackios-usb`, and ufw needs the `route allow` rule. |
+| Internet by address works, but no names: Safari can't open Google, Sileo can't add repos | Seen once, cause not found; the computer side was fine. On the phone (`ssh miatoll`), `/redwood/bin/net_test store State:/Network/Global/DNS resolve google.com` must show `ServerAddresses = ( "10.42.0.1" )` and an address. If it doesn't, boot again from fastboot. Don't restart `hackios-usb` on the computer while iOS runs: the phone doesn't ask for its address again. (A bash `/dev/tcp/NAME/...` test fails even when names work; use `net_test`.) |
 | A new adapter name after changing USB ports | Add the two ufw rules for the new name. |
 | `ssh miatoll` is refused | The keys weren't in `ssh/` when the image was built: rebuild it and boot again. |
 | A change from the last minute is gone | It came after the last save, and the phone reset before the next one. |
